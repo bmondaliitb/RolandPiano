@@ -47,6 +47,13 @@ class PianoTrainerApp(tk.Tk):
         self.send_to_piano = tk.BooleanVar(value=send_to_piano)
         self.practice_mode = tk.BooleanVar(value=False)
         self.show_fingers = tk.BooleanVar(value=False)
+        self.loop_enabled = tk.BooleanVar(value=False)
+        self.loop_start = 0.0
+        self.loop_end: Optional[float] = None
+        self.loop_text = tk.StringVar(value="Loop: not set")
+        self.position = tk.DoubleVar(value=0.0)
+        self.position_text = tk.StringVar(value="0.0s")
+        self.updating_position = False
         self.output_port = None
         self.input_port = None
         self.input_messages: queue.Queue = queue.Queue()
@@ -102,8 +109,39 @@ class PianoTrainerApp(tk.Tk):
             row=1, column=6, columnspan=2, sticky="w", pady=(7, 0)
         )
 
+        ttk.Button(toolbar, text="Set A", command=self.set_loop_start).grid(
+            row=2, column=0, sticky="w", pady=(7, 0)
+        )
+        ttk.Button(toolbar, text="Set B", command=self.set_loop_end).grid(
+            row=2, column=1, sticky="w", pady=(7, 0)
+        )
+        ttk.Checkbutton(
+            toolbar,
+            text="Loop",
+            variable=self.loop_enabled,
+            command=self._loop_enabled_changed,
+        ).grid(row=2, column=2, sticky="w", pady=(7, 0))
+        ttk.Button(toolbar, text="Clear", command=self.clear_loop).grid(
+            row=2, column=3, sticky="w", pady=(7, 0)
+        )
+        ttk.Label(toolbar, textvariable=self.loop_text).grid(
+            row=2, column=4, columnspan=4, sticky="w", padx=(10, 0), pady=(7, 0)
+        )
+
+        ttk.Label(toolbar, text="Position").grid(row=3, column=0, sticky="w", pady=(7, 0))
+        self.position_scale = ttk.Scale(
+            toolbar,
+            variable=self.position,
+            from_=0.0,
+            to=1.0,
+            command=self._position_changed,
+            state="disabled",
+        )
+        self.position_scale.grid(row=3, column=1, columnspan=7, sticky="ew", padx=(6, 8), pady=(7, 0))
+        ttk.Label(toolbar, textvariable=self.position_text).grid(row=3, column=8, sticky="e", pady=(7, 0))
+
         self.status = ttk.Label(toolbar, text="Open a MIDI file to begin.")
-        self.status.grid(row=2, column=0, columnspan=9, sticky="ew", pady=(7, 0))
+        self.status.grid(row=4, column=0, columnspan=9, sticky="ew", pady=(7, 0))
 
         self.roll = tk.Canvas(self, background="#15171a", highlightthickness=0)
         self.roll.grid(row=1, column=0, sticky="nsew")
@@ -150,6 +188,9 @@ class PianoTrainerApp(tk.Tk):
         self.pressed_notes.clear()
         self.paused_at = 0.0
         self.sent_note_ons.clear()
+        self.clear_loop()
+        self.position_scale.configure(to=max(song.duration, 0.1), state="normal")
+        self._update_position_display()
         self.play_button.configure(state="normal", text="Play")
         self._update_status()
         self.draw()
@@ -171,6 +212,8 @@ class PianoTrainerApp(tk.Tk):
     def start_playback(self) -> None:
         if self.practice_mode.get() and not self._ensure_input_port():
             return
+        if self._loop_is_active() and not self.loop_start <= self.paused_at < self.loop_end:
+            self._move_to_loop_start()
         self.playing = True
         self.started_at = time.monotonic() - (self.paused_at / self.tempo.get())
         self.play_button.configure(text="Pause")
@@ -211,13 +254,25 @@ class PianoTrainerApp(tk.Tk):
     def seek_relative(self, seconds: float) -> None:
         if self.song is None:
             return
-        self.paused_at = min(max(0.0, self.current_time() + seconds), self.song.duration)
+        self._seek_to(self.current_time() + seconds)
+
+    def _position_changed(self, value: str) -> None:
+        if self.updating_position or self.song is None:
+            return
+        self._seek_to(float(value))
+
+    def _seek_to(self, position: float) -> None:
+        if self.song is None:
+            return
+        self.paused_at = min(max(0.0, position), self.song.duration)
         self.sent_note_ons.clear()
         self._set_practice_index_for_time(self.paused_at)
         self.practice_waiting = False
         if self.playing:
             self.started_at = time.monotonic() - (self.paused_at / self.tempo.get())
         self._all_notes_off()
+        self._update_position_display()
+        self._update_status()
         self.draw()
 
     def current_time(self) -> float:
@@ -231,6 +286,9 @@ class PianoTrainerApp(tk.Tk):
         self.tempo_label.configure(text=f"{round(self.tempo.get() * 100):d}%")
         if self.song and self.playing:
             now = self.current_time()
+            if self._loop_is_active() and now >= self.loop_end:
+                self._restart_loop()
+                now = self.loop_start
             if self.practice_mode.get():
                 now = self._update_practice_wait(now)
             else:
@@ -242,7 +300,77 @@ class PianoTrainerApp(tk.Tk):
             self.draw()
         else:
             self._drain_input_messages()
+        self._update_position_display()
         self.after(16, self._tick)
+
+    def _update_position_display(self) -> None:
+        position = self.current_time()
+        self.updating_position = True
+        self.position.set(position)
+        self.updating_position = False
+        self.position_text.set(f"{position:.2f}s")
+
+    def set_loop_start(self) -> None:
+        if self.song is None:
+            return
+        self.loop_start = min(self.current_time(), self.song.duration)
+        if self.loop_end is not None and self.loop_end <= self.loop_start + 0.05:
+            self.loop_end = None
+            self.loop_enabled.set(False)
+        self._update_loop_text()
+        self._update_status()
+        self.draw()
+
+    def set_loop_end(self) -> None:
+        if self.song is None:
+            return
+        position = min(self.current_time(), self.song.duration)
+        if position <= self.loop_start + 0.05:
+            messagebox.showwarning("Invalid loop", "Loop end B must be after loop start A.")
+            return
+        self.loop_end = position
+        self.loop_enabled.set(True)
+        self._update_loop_text()
+        self._update_status()
+        self.draw()
+
+    def clear_loop(self) -> None:
+        self.loop_enabled.set(False)
+        self.loop_start = 0.0
+        self.loop_end = None
+        self._update_loop_text()
+        if self.song is not None:
+            self._update_status()
+            self.draw()
+
+    def _loop_enabled_changed(self) -> None:
+        if self.loop_enabled.get() and self.loop_end is None:
+            self.loop_enabled.set(False)
+            messagebox.showwarning("Loop not set", "Set loop start A and loop end B first.")
+        self._update_loop_text()
+        self._update_status()
+
+    def _loop_is_active(self) -> bool:
+        return self.loop_enabled.get() and self.loop_end is not None and self.loop_end > self.loop_start
+
+    def _restart_loop(self) -> None:
+        self._all_notes_off()
+        self.pressed_notes.clear()
+        self._move_to_loop_start()
+        self.started_at = time.monotonic() - (self.loop_start / self.tempo.get())
+        self._update_status()
+
+    def _move_to_loop_start(self) -> None:
+        self.paused_at = self.loop_start
+        self.practice_waiting = False
+        self._set_practice_index_for_time(self.loop_start)
+
+    def _update_loop_text(self) -> None:
+        if self.loop_end is None:
+            self.loop_text.set(f"Loop: A {self.loop_start:.2f}s, B not set")
+            return
+        state = "on" if self.loop_enabled.get() else "off"
+        self.loop_text.set(f"Loop: A {self.loop_start:.2f}s - B {self.loop_end:.2f}s ({state})")
 
     def _send_due_notes(self, now: float) -> None:
         if not self.send_to_piano.get() or self.output_port is None or self.song is None:
@@ -320,9 +448,12 @@ class PianoTrainerApp(tk.Tk):
         self.practice_index += 1
         self.practice_waiting = False
         if self.practice_index >= len(self.practice_steps):
-            self.paused_at = self.song.duration if self.song else self.paused_at
-            self.playing = False
-            self.play_button.configure(text="Play")
+            if self._loop_is_active():
+                self._restart_loop()
+            else:
+                self.paused_at = self.song.duration if self.song else self.paused_at
+                self.playing = False
+                self.play_button.configure(text="Play")
         else:
             self.started_at = time.monotonic() - (self.paused_at / self.tempo.get())
         self._update_status()
@@ -353,6 +484,8 @@ class PianoTrainerApp(tk.Tk):
                 text = f"{self.song.path.name}: next {self._step_text(step)}"
         else:
             text = f"{self.song.path.name}: {len(self.song.notes)} notes, {self.song.duration:.1f}s"
+        if self._loop_is_active():
+            text += f" | Loop {self.loop_start:.2f}-{self.loop_end:.2f}s"
         self.status.configure(text=text)
 
     def _all_notes_off(self) -> None:
@@ -392,6 +525,10 @@ class PianoTrainerApp(tk.Tk):
                 fill = "#f2c14e"
             self.roll.create_rectangle(x1, y1, x2, y2, fill=fill, outline="")
 
+        self._draw_loop_marker(self.loop_start, "A", "#27ae60", start_time, pixels_per_second, width, height)
+        if self.loop_end is not None:
+            self._draw_loop_marker(self.loop_end, "B", "#d64545", start_time, pixels_per_second, width, height)
+
         next_notes = [note for note in self.song.notes if note.start >= now][:8]
         step = self._current_practice_step() if self.practice_mode.get() else None
         if self.practice_waiting and step is not None:
@@ -408,6 +545,24 @@ class PianoTrainerApp(tk.Tk):
             text = "  ".join(note.name for note in next_notes)
             self.roll.create_text(14, 16, text=f"Next: {text}", fill="#e8e8e8", anchor="nw", font=("TkDefaultFont", 14))
         self.roll.create_text(width - 14, 16, text=f"{now:.1f} / {self.song.duration:.1f}s", fill="#e8e8e8", anchor="ne")
+
+    def _draw_loop_marker(
+        self,
+        position: float,
+        label: str,
+        color: str,
+        start_time: float,
+        pixels_per_second: float,
+        width: int,
+        height: int,
+    ) -> None:
+        if self.loop_end is None:
+            return
+        y = height - 42 - ((position - start_time) * pixels_per_second)
+        if not 0 <= y <= height:
+            return
+        self.roll.create_line(0, y, width, y, fill=color, width=2, dash=(6, 4))
+        self.roll.create_text(8, y - 4, text=label, fill=color, anchor="sw", font=("TkDefaultFont", 10, "bold"))
 
     def _draw_keyboard(self) -> None:
         width = max(self.keyboard.winfo_width(), 1)
