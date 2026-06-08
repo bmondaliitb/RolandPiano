@@ -50,6 +50,8 @@ To practice in wait mode:
 
 Correct pressed keys turn green. Extra incorrect keys turn red. For chords, all chord notes must be held together before the song advances.
 
+Enable `Show fingers` to display suggested finger labels on target keys and in the practice prompt. `L` and `R` mean left and right hand; fingers are numbered `1` for the thumb through `5` for the little finger. These suggestions are generated from note position and common chord shapes because ordinary MIDI files do not contain authoritative fingering.
+
 Or open a song immediately:
 
 ```bash

@@ -22,6 +22,7 @@ from .song_trainer import (
     open_input_port,
     open_output_port,
     practice_step_matches,
+    suggest_fingering,
 )
 
 
@@ -45,6 +46,7 @@ class PianoTrainerApp(tk.Tk):
         self.follow = tk.BooleanVar(value=True)
         self.send_to_piano = tk.BooleanVar(value=send_to_piano)
         self.practice_mode = tk.BooleanVar(value=False)
+        self.show_fingers = tk.BooleanVar(value=False)
         self.output_port = None
         self.input_port = None
         self.input_messages: queue.Queue = queue.Queue()
@@ -81,17 +83,27 @@ class PianoTrainerApp(tk.Tk):
         self.tempo_label = ttk.Label(toolbar, text="100%")
         self.tempo_label.grid(row=0, column=5, padx=(0, 12))
 
-        ttk.Checkbutton(toolbar, text="Send to Roland", variable=self.send_to_piano).grid(row=0, column=6, padx=(0, 10))
+        ttk.Checkbutton(toolbar, text="Send to Roland", variable=self.send_to_piano).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(7, 0)
+        )
         ttk.Checkbutton(
             toolbar,
             text="Wait for keys",
             variable=self.practice_mode,
             command=self._practice_mode_changed,
-        ).grid(row=0, column=7, padx=(0, 10))
-        ttk.Checkbutton(toolbar, text="Follow", variable=self.follow).grid(row=0, column=8, sticky="w")
+        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(
+            toolbar,
+            text="Show fingers",
+            variable=self.show_fingers,
+            command=self.draw,
+        ).grid(row=1, column=4, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(toolbar, text="Follow", variable=self.follow).grid(
+            row=1, column=6, columnspan=2, sticky="w", pady=(7, 0)
+        )
 
         self.status = ttk.Label(toolbar, text="Open a MIDI file to begin.")
-        self.status.grid(row=1, column=0, columnspan=9, sticky="ew", pady=(7, 0))
+        self.status.grid(row=2, column=0, columnspan=9, sticky="ew", pady=(7, 0))
 
         self.roll = tk.Canvas(self, background="#15171a", highlightthickness=0)
         self.roll.grid(row=1, column=0, sticky="nsew")
@@ -336,9 +348,9 @@ class PianoTrainerApp(tk.Tk):
             if step is None:
                 text = f"{self.song.path.name}: practice complete"
             elif self.practice_waiting:
-                text = f"Play: {' + '.join(step.names)}"
+                text = f"Play: {self._step_text(step)}"
             else:
-                text = f"{self.song.path.name}: next {' + '.join(step.names)}"
+                text = f"{self.song.path.name}: next {self._step_text(step)}"
         else:
             text = f"{self.song.path.name}: {len(self.song.notes)} notes, {self.song.duration:.1f}s"
         self.status.configure(text=text)
@@ -383,7 +395,7 @@ class PianoTrainerApp(tk.Tk):
         next_notes = [note for note in self.song.notes if note.start >= now][:8]
         step = self._current_practice_step() if self.practice_mode.get() else None
         if self.practice_waiting and step is not None:
-            text = " + ".join(step.names)
+            text = self._step_text(step)
             self.roll.create_text(
                 width / 2,
                 height - 68,
@@ -401,7 +413,9 @@ class PianoTrainerApp(tk.Tk):
         width = max(self.keyboard.winfo_width(), 1)
         height = max(self.keyboard.winfo_height(), 1)
         active = self._active_notes()
-        expected = set(self._current_practice_step().notes) if self.practice_waiting and self._current_practice_step() else set()
+        step = self._current_practice_step()
+        expected = set(step.notes) if self.practice_waiting and step else set()
+        finger_labels = self._finger_labels(step)
         white_notes = [note for note in range(LOW_NOTE, HIGH_NOTE + 1) if note % 12 in WHITE_KEY_PATTERN]
         white_width = width / len(white_notes)
         white_positions: Dict[int, Tuple[float, float]] = {}
@@ -415,6 +429,7 @@ class PianoTrainerApp(tk.Tk):
             if note % 12 == 0:
                 self.keyboard.create_text((x1 + x2) / 2, height - 16, text=note_name(note), fill="#30343a", font=("TkDefaultFont", 9))
 
+        black_positions: Dict[int, Tuple[float, float]] = {}
         for note in range(LOW_NOTE, HIGH_NOTE + 1):
             if not is_black_key(note):
                 continue
@@ -424,6 +439,41 @@ class PianoTrainerApp(tk.Tk):
             center = x2
             fill = self._key_fill(note, active, expected, black=True)
             self.keyboard.create_rectangle(center - black_width / 2, 0, center + black_width / 2, height * 0.62, fill=fill, outline="#111")
+            black_positions[note] = (center - black_width / 2, center + black_width / 2)
+
+        for note, label in finger_labels.items():
+            if note in black_positions:
+                x1, x2 = black_positions[note]
+                y = height * 0.47
+                fill = "#ffffff"
+            elif note in white_positions:
+                x1, x2 = white_positions[note]
+                y = height - 38
+                fill = "#20242a"
+            else:
+                continue
+            self.keyboard.create_text(
+                (x1 + x2) / 2,
+                y,
+                text=label,
+                fill=fill,
+                font=("TkDefaultFont", 9, "bold"),
+            )
+
+    def _step_text(self, step: PracticeStep) -> str:
+        labels = self._finger_labels(step)
+        return " + ".join(
+            f"{note_name(note)} ({labels[note]})" if note in labels else note_name(note)
+            for note in step.notes
+        )
+
+    def _finger_labels(self, step: Optional[PracticeStep]) -> Dict[int, str]:
+        if not self.practice_mode.get() or not self.show_fingers.get() or step is None:
+            return {}
+        return {
+            suggestion.note: suggestion.label
+            for suggestion in suggest_fingering(step)
+        }
 
     def _key_fill(self, note: int, active: Set[int], expected: Set[int], black: bool) -> str:
         if self.practice_mode.get():

@@ -54,6 +54,17 @@ class PracticeStep:
         return tuple(note_name(note) for note in self.notes)
 
 
+@dataclass(frozen=True)
+class FingerSuggestion:
+    note: int
+    hand: str
+    finger: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.hand}{self.finger}"
+
+
 def note_name(note: int) -> str:
     names = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
     octave = note // 12 - 1
@@ -143,6 +154,53 @@ def build_practice_steps(song: Song, chord_tolerance: float = 0.04) -> Tuple[Pra
 
 def practice_step_matches(step: PracticeStep, pressed_notes: Set[int]) -> bool:
     return pressed_notes == set(step.notes)
+
+
+def suggest_fingering(step: PracticeStep) -> Tuple[FingerSuggestion, ...]:
+    left_notes, right_notes = _split_hands(step.notes)
+    suggestions = _finger_hand(left_notes, hand="L")
+    suggestions.extend(_finger_hand(right_notes, hand="R"))
+    return tuple(sorted(suggestions, key=lambda suggestion: suggestion.note))
+
+
+def _split_hands(notes: Tuple[int, ...]) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    ordered = tuple(sorted(notes))
+    if len(ordered) <= 5:
+        left = tuple(note for note in ordered if note < 60)
+        right = tuple(note for note in ordered if note >= 60)
+        return left, right
+
+    split = sum(note < 60 for note in ordered)
+    split = max(len(ordered) - 5, min(5, split))
+    return ordered[:split], ordered[split:]
+
+
+def _finger_hand(notes: Tuple[int, ...], hand: str) -> List[FingerSuggestion]:
+    if not notes:
+        return []
+    if len(notes) == 1:
+        finger = _single_note_finger(notes[0], hand)
+        return [FingerSuggestion(note=notes[0], hand=hand, finger=finger)]
+
+    right_patterns = {
+        2: (1, 5),
+        3: (1, 3, 5),
+        4: (1, 2, 3, 5),
+        5: (1, 2, 3, 4, 5),
+    }
+    fingers = right_patterns.get(len(notes), tuple(min(index + 1, 5) for index in range(len(notes))))
+    if hand == "L":
+        fingers = tuple(reversed(fingers))
+    return [
+        FingerSuggestion(note=note, hand=hand, finger=finger)
+        for note, finger in zip(sorted(notes), fingers)
+    ]
+
+
+def _single_note_finger(note: int, hand: str) -> int:
+    right_by_pitch_class = (1, 2, 2, 3, 3, 1, 2, 2, 3, 3, 4, 4)
+    left_by_pitch_class = (1, 2, 2, 3, 3, 4, 4, 5, 4, 3, 2, 2)
+    return right_by_pitch_class[note % 12] if hand == "R" else left_by_pitch_class[note % 12]
 
 
 def _midi_files(directory: Path) -> List[Path]:

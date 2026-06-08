@@ -10,6 +10,7 @@ from src.roland_piano.song_trainer import (
     load_song,
     note_name,
     practice_step_matches,
+    suggest_fingering,
 )
 
 
@@ -64,6 +65,20 @@ class TestSongTrainer(unittest.TestCase):
         self.assertFalse(practice_step_matches(step, {60, 64}))
         self.assertFalse(practice_step_matches(step, {60, 64, 67, 72}))
         self.assertTrue(practice_step_matches(step, {60, 64, 67}))
+
+    def test_fingering_suggests_standard_triad_shapes(self):
+        left = suggest_fingering(PracticeStep(start=0.0, notes=(48, 52, 55)))
+        right = suggest_fingering(PracticeStep(start=0.0, notes=(60, 64, 67)))
+
+        self.assertEqual([(item.note, item.label) for item in left], [(48, "L5"), (52, "L3"), (55, "L1")])
+        self.assertEqual([(item.note, item.label) for item in right], [(60, "R1"), (64, "R3"), (67, "R5")])
+
+    def test_fingering_assigns_single_notes_by_hand(self):
+        left = suggest_fingering(PracticeStep(start=0.0, notes=(48,)))
+        right = suggest_fingering(PracticeStep(start=0.0, notes=(60,)))
+
+        self.assertEqual(left[0].label, "L1")
+        self.assertEqual(right[0].label, "R1")
 
 
 if __name__ == "__main__":
