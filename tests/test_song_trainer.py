@@ -4,6 +4,9 @@ from pathlib import Path
 
 import mido
 
+from src.roland_piano.roland_address_map import RolandAddressMap
+from src.roland_piano.roland_messages import RolandMessageRequest
+from src.roland_piano.roland_utils import RolandCmd
 from src.roland_piano.song_trainer import (
     PracticeStep,
     build_practice_steps,
@@ -119,6 +122,17 @@ class TestSongTrainer(unittest.TestCase):
     def test_velocity_shaping_does_not_force_quiet_notes_louder(self):
         self.assertEqual(shape_velocity(20, 85), 17)
         self.assertEqual(shape_velocity(127, 110), 127)
+
+    def test_roland_master_volume_message(self):
+        message = RolandMessageRequest(
+            register=RolandAddressMap.masterVolume,
+            cmd=RolandCmd.WRITE,
+            data_as_int=42,
+        ).as_mido_message
+
+        self.assertEqual(message.type, "sysex")
+        self.assertEqual(tuple(message.data[7:11]), tuple(RolandAddressMap.masterVolume.address))
+        self.assertEqual(message.data[11], 42)
 
 
 if __name__ == "__main__":

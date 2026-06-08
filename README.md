@@ -41,6 +41,8 @@ Run the app:
 roland-piano-trainer
 ```
 
+The application icon source and Fedora/GNOME-compatible PNG sizes are available under `assets/icons/`. The packaged app also uses the icon in its window and task switcher.
+
 To practice in wait mode:
 
 1. Connect the FP-10 to Fedora by USB and open a MIDI song.
@@ -64,6 +66,12 @@ roland-piano-trainer --send-to-piano path/to/song.mid
 `--send-to-piano` sends the MIDI notes to the first MIDI output whose name starts with `Roland Digital Piano`. You can use the app without a connected FP-10; it will still show the falling notes and highlighted keys.
 
 When sending MIDI to the Roland, use `Dynamics` to adjust output velocity. The default `85%` softens aggressive MIDI files while preserving their quiet notes and accents. Playback also preserves sustain, sostenuto, and soft-pedal messages, handles repeated pitches independently, and ignores the standard MIDI percussion channel. Piano-only MIDI files will sound cleaner than dense arrangements containing several instrumental parts.
+
+Use `Piano volume` to adjust the FP-10 master volume from the app. This is independent of `Dynamics`: master volume changes overall loudness, while Dynamics changes how softly or strongly MIDI notes are played.
+
+The app saves its window size, last song, playhead position, controls, practice options, and loop selection when it closes. The next launch restores that state while remaining paused. State is stored at `$XDG_CONFIG_HOME/roland-piano/trainer-state.json`, or `~/.config/roland-piano/trainer-state.json` when `XDG_CONFIG_HOME` is not set.
+
+Use `Save Project` to store the current song, playhead, controls, practice options, and loop in a named `.roland-project.json` file. `Load Project` restores it later while remaining paused. When the project and MIDI file are kept in the same folder, the song path is saved relatively so the folder can be moved together.
 
 Audio transcription quality depends on the input recording and on the converter you choose. Clean solo piano audio works best; dense full-band recordings can produce noisy MIDI.
 

@@ -11,6 +11,10 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import mido
 
+from .app_state import load_app_state, load_project, save_app_state, save_project
+from .roland_address_map import RolandAddressMap
+from .roland_messages import RolandMessageRequest
+from .roland_utils import RolandCmd
 from .song_trainer import (
     PracticeStep,
     Song,
@@ -35,20 +39,35 @@ WHITE_KEY_PATTERN = {0, 2, 4, 5, 7, 9, 11}
 class PianoTrainerApp(tk.Tk):
     def __init__(self, initial_song: Optional[str] = None, send_to_piano: bool = False) -> None:
         super().__init__()
+        self.saved_state = load_app_state()
+        self.pending_song_state = None
         self.title("Roland FP-10 Piano Trainer")
-        self.geometry("1180x760")
+        self.app_icon = None
+        icon_path = Path(__file__).parent / "assets" / "roland-piano-trainer.png"
+        if icon_path.is_file():
+            try:
+                self.app_icon = tk.PhotoImage(file=str(icon_path))
+                self.iconphoto(True, self.app_icon)
+            except tk.TclError:
+                self.app_icon = None
+        try:
+            self.geometry(self.saved_state.get("geometry", "1180x760"))
+        except tk.TclError:
+            self.geometry("1180x760")
         self.minsize(900, 620)
 
         self.song: Optional[Song] = None
         self.playing = False
         self.started_at = 0.0
         self.paused_at = 0.0
-        self.tempo = tk.DoubleVar(value=1.0)
-        self.dynamics = tk.IntVar(value=85)
-        self.follow = tk.BooleanVar(value=True)
-        self.send_to_piano = tk.BooleanVar(value=send_to_piano)
-        self.practice_mode = tk.BooleanVar(value=False)
-        self.show_fingers = tk.BooleanVar(value=False)
+        self.tempo = tk.DoubleVar(value=self._saved_number("tempo", 1.0, 0.4, 1.5))
+        self.dynamics = tk.IntVar(value=round(self._saved_number("dynamics", 85, 50, 110)))
+        self.piano_volume = tk.IntVar(value=round(self._saved_number("piano_volume", 50, 0, 100)))
+        self.piano_volume_after_id = None
+        self.follow = tk.BooleanVar(value=self._saved_bool("follow", True))
+        self.send_to_piano = tk.BooleanVar(value=send_to_piano or self._saved_bool("send_to_piano", False))
+        self.practice_mode = tk.BooleanVar(value=self._saved_bool("practice_mode", False))
+        self.show_fingers = tk.BooleanVar(value=self._saved_bool("show_fingers", False))
         self.loop_enabled = tk.BooleanVar(value=False)
         self.loop_start = 0.0
         self.loop_end: Optional[float] = None
@@ -68,10 +87,35 @@ class PianoTrainerApp(tk.Tk):
         self.preview_seconds = 5.0
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._close_app)
+        self.after_idle(self._restore_window_state)
         self.after(16, self._tick)
 
         if initial_song:
             self.load_file(Path(initial_song))
+        else:
+            saved_song = self.saved_state.get("song")
+            if isinstance(saved_song, str) and Path(saved_song).is_file():
+                self.pending_song_state = self.saved_state
+                self.load_file(Path(saved_song))
+
+    def _saved_number(self, key: str, default: float, minimum: float, maximum: float) -> float:
+        value = self.saved_state.get(key, default)
+        if not isinstance(value, (int, float)):
+            return default
+        return min(maximum, max(minimum, float(value)))
+
+    def _saved_bool(self, key: str, default: bool) -> bool:
+        value = self.saved_state.get(key, default)
+        return value if isinstance(value, bool) else default
+
+    def _restore_window_state(self) -> None:
+        if not self._saved_bool("maximized", False):
+            return
+        try:
+            self.attributes("-zoomed", True)
+        except tk.TclError:
+            pass
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -122,6 +166,12 @@ class PianoTrainerApp(tk.Tk):
         ttk.Checkbutton(toolbar, text="Follow", variable=self.follow).grid(
             row=1, column=6, columnspan=2, sticky="w", pady=(7, 0)
         )
+        ttk.Button(toolbar, text="Save Project", command=self.save_project_file).grid(
+            row=1, column=8, sticky="e", padx=(10, 4), pady=(7, 0)
+        )
+        ttk.Button(toolbar, text="Load Project", command=self.load_project_file).grid(
+            row=1, column=9, columnspan=2, sticky="e", pady=(7, 0)
+        )
 
         ttk.Button(toolbar, text="Set A", command=self.set_loop_start).grid(
             row=2, column=0, sticky="w", pady=(7, 0)
@@ -141,6 +191,18 @@ class PianoTrainerApp(tk.Tk):
         ttk.Label(toolbar, textvariable=self.loop_text).grid(
             row=2, column=4, columnspan=4, sticky="w", padx=(10, 0), pady=(7, 0)
         )
+        ttk.Label(toolbar, text="Piano volume").grid(row=2, column=8, sticky="e", padx=(10, 4), pady=(7, 0))
+        ttk.Scale(
+            toolbar,
+            variable=self.piano_volume,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            length=120,
+            command=self._piano_volume_changed,
+        ).grid(row=2, column=9, sticky="ew", pady=(7, 0))
+        self.piano_volume_label = ttk.Label(toolbar, text="50")
+        self.piano_volume_label.grid(row=2, column=10, sticky="e", padx=(6, 0), pady=(7, 0))
 
         ttk.Label(toolbar, text="Position").grid(row=3, column=0, sticky="w", pady=(7, 0))
         self.position_scale = ttk.Scale(
@@ -179,6 +241,75 @@ class PianoTrainerApp(tk.Tk):
         if path:
             self.load_file(Path(path))
 
+    def save_project_file(self) -> None:
+        if self.song is None:
+            messagebox.showwarning("No project to save", "Open a song before saving a project.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save piano trainer project",
+            defaultextension=".roland-project.json",
+            filetypes=[
+                ("Roland piano project", "*.roland-project.json"),
+                ("JSON", "*.json"),
+            ],
+            initialfile=f"{self.song.path.stem}.roland-project.json",
+        )
+        if not path:
+            return
+        try:
+            save_project(self._session_state(include_window=False), Path(path))
+        except OSError as exc:
+            messagebox.showerror("Could not save project", str(exc))
+            return
+        self.status.configure(text=f"Project saved: {Path(path).name}")
+
+    def load_project_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Load piano trainer project",
+            filetypes=[
+                ("Roland piano project", "*.roland-project.json"),
+                ("JSON", "*.json"),
+                ("All files", "*"),
+            ],
+        )
+        if not path:
+            return
+        project = load_project(Path(path))
+        if not project:
+            messagebox.showerror("Could not load project", "This is not a valid Roland piano trainer project.")
+            return
+        song = project.get("song")
+        if not isinstance(song, str) or not Path(song).is_file():
+            messagebox.showerror("Song not found", f"The project song could not be found:\n{song or 'No song path'}")
+            return
+
+        self.stop_playback(send_off=True)
+        self._apply_control_state(project)
+        self.pending_song_state = project
+        self.load_file(Path(song))
+
+    def _apply_control_state(self, state: dict) -> None:
+        numeric_controls = (
+            (self.tempo, "tempo", 0.4, 1.5),
+            (self.dynamics, "dynamics", 50, 110),
+            (self.piano_volume, "piano_volume", 0, 100),
+        )
+        for variable, key, minimum, maximum in numeric_controls:
+            value = state.get(key)
+            if isinstance(value, (int, float)):
+                variable.set(min(maximum, max(minimum, value)))
+
+        boolean_controls = (
+            (self.follow, "follow"),
+            (self.send_to_piano, "send_to_piano"),
+            (self.practice_mode, "practice_mode"),
+            (self.show_fingers, "show_fingers"),
+        )
+        for variable, key in boolean_controls:
+            value = state.get(key)
+            if isinstance(value, bool):
+                variable.set(value)
+
     def load_file(self, path: Path) -> None:
         self.stop_playback(send_off=True)
         self.status.configure(text=f"Loading {path.name}...")
@@ -204,10 +335,31 @@ class PianoTrainerApp(tk.Tk):
         self._reset_output_playback(0.0)
         self.clear_loop()
         self.position_scale.configure(to=max(song.duration, 0.1), state="normal")
+        if self.pending_song_state is not None:
+            self._restore_song_state(self.pending_song_state)
+            self.pending_song_state = None
         self._update_position_display()
         self.play_button.configure(state="normal", text="Play")
         self._update_status()
         self.draw()
+
+    def _restore_song_state(self, state: dict) -> None:
+        position = state.get("position", 0.0)
+        if isinstance(position, (int, float)):
+            self.paused_at = min(max(0.0, float(position)), self.song.duration)
+
+        loop_start = state.get("loop_start", 0.0)
+        loop_end = state.get("loop_end")
+        if isinstance(loop_start, (int, float)):
+            self.loop_start = min(max(0.0, float(loop_start)), self.song.duration)
+        if isinstance(loop_end, (int, float)) and self.loop_start + 0.05 < float(loop_end) <= self.song.duration:
+            self.loop_end = float(loop_end)
+            self.loop_enabled.set(bool(state.get("loop_enabled", False)))
+
+        self.practice_waiting = False
+        self._set_practice_index_for_time(self.paused_at)
+        self._reset_output_playback(self.paused_at)
+        self._update_loop_text()
 
     def _load_failed(self, exc: BaseException) -> None:
         self.play_button.configure(state="normal")
@@ -234,19 +386,8 @@ class PianoTrainerApp(tk.Tk):
         self._update_status()
         if self.practice_mode.get():
             return
-        if self.send_to_piano.get() and self.output_port is None:
-            try:
-                self.output_port = open_output_port()
-            except Exception as exc:
-                self.send_to_piano.set(False)
-                messagebox.showwarning("Roland output unavailable", str(exc))
-            else:
-                if self.output_port is None:
-                    self.send_to_piano.set(False)
-                    messagebox.showwarning(
-                        "Roland output unavailable",
-                        "No Roland Digital Piano MIDI output port was found.",
-                    )
+        if self.send_to_piano.get() and not self._ensure_output_port():
+            self.send_to_piano.set(False)
         if self.send_to_piano.get() and self.output_port is not None:
             self._reset_output_playback(self.paused_at)
 
@@ -303,6 +444,7 @@ class PianoTrainerApp(tk.Tk):
     def _tick(self) -> None:
         self.tempo_label.configure(text=f"{round(self.tempo.get() * 100):d}%")
         self.dynamics_label.configure(text=f"{self.dynamics.get()}%")
+        self.piano_volume_label.configure(text=str(round(self.piano_volume.get())))
         if self.song and self.playing:
             now = self.current_time()
             if self._loop_is_active() and now >= self.loop_end:
@@ -321,6 +463,51 @@ class PianoTrainerApp(tk.Tk):
             self._drain_input_messages()
         self._update_position_display()
         self.after(16, self._tick)
+
+    def _piano_volume_changed(self, value: str) -> None:
+        volume = max(0, min(100, round(float(value))))
+        self.piano_volume.set(volume)
+        self.piano_volume_label.configure(text=str(volume))
+        if self.piano_volume_after_id is not None:
+            self.after_cancel(self.piano_volume_after_id)
+        self.piano_volume_after_id = self.after(120, self._send_piano_volume)
+
+    def _send_piano_volume(self) -> None:
+        self.piano_volume_after_id = None
+        if not self._ensure_output_port():
+            return
+        volume = max(0, min(100, round(self.piano_volume.get())))
+        connection_message = RolandMessageRequest(
+            register=RolandAddressMap.connection,
+            cmd=RolandCmd.WRITE,
+            data_as_int=1,
+        )
+        message = RolandMessageRequest(
+            register=RolandAddressMap.masterVolume,
+            cmd=RolandCmd.WRITE,
+            data_as_int=volume,
+        )
+        try:
+            self.output_port.send(connection_message.as_mido_message)
+            self.output_port.send(message.as_mido_message)
+        except Exception as exc:
+            messagebox.showwarning("Piano volume unavailable", str(exc))
+
+    def _ensure_output_port(self) -> bool:
+        if self.output_port is not None:
+            return True
+        try:
+            self.output_port = open_output_port()
+        except Exception as exc:
+            messagebox.showwarning("Roland output unavailable", str(exc))
+            return False
+        if self.output_port is None:
+            messagebox.showwarning(
+                "Roland output unavailable",
+                "No Roland Digital Piano MIDI output port was found.",
+            )
+            return False
+        return True
 
     def _update_position_display(self) -> None:
         position = self.current_time()
@@ -707,7 +894,41 @@ class PianoTrainerApp(tk.Tk):
         now = self.current_time()
         return {note.note for note in self.song.notes if note.start <= now <= note.end}
 
+    def _session_state(self, include_window: bool) -> dict:
+        state = {
+            "song": str(self.song.path) if self.song is not None else None,
+            "position": self.current_time(),
+            "tempo": self.tempo.get(),
+            "dynamics": self.dynamics.get(),
+            "piano_volume": self.piano_volume.get(),
+            "follow": self.follow.get(),
+            "send_to_piano": self.send_to_piano.get(),
+            "practice_mode": self.practice_mode.get(),
+            "show_fingers": self.show_fingers.get(),
+            "loop_start": self.loop_start,
+            "loop_end": self.loop_end,
+            "loop_enabled": self.loop_enabled.get(),
+        }
+        if not include_window:
+            return state
+        try:
+            maximized = bool(self.attributes("-zoomed"))
+        except tk.TclError:
+            maximized = False
+        state["geometry"] = self.geometry()
+        state["maximized"] = maximized
+        return state
+
+    def _close_app(self) -> None:
+        try:
+            save_app_state(self._session_state(include_window=True))
+        except OSError:
+            pass
+        self.destroy()
+
     def destroy(self) -> None:
+        if self.piano_volume_after_id is not None:
+            self.after_cancel(self.piano_volume_after_id)
         self._all_notes_off()
         if self.output_port is not None:
             self.output_port.close()
