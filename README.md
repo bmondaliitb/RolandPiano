@@ -63,6 +63,8 @@ roland-piano-trainer --send-to-piano path/to/song.mid
 
 `--send-to-piano` sends the MIDI notes to the first MIDI output whose name starts with `Roland Digital Piano`. You can use the app without a connected FP-10; it will still show the falling notes and highlighted keys.
 
+When sending MIDI to the Roland, use `Dynamics` to adjust output velocity. The default `85%` softens aggressive MIDI files while preserving their quiet notes and accents. Playback also preserves sustain, sostenuto, and soft-pedal messages, handles repeated pitches independently, and ignores the standard MIDI percussion channel. Piano-only MIDI files will sound cleaner than dense arrangements containing several instrumental parts.
+
 Audio transcription quality depends on the input recording and on the converter you choose. Clean solo piano audio works best; dense full-band recordings can produce noisy MIDI.
 
 # Limitations

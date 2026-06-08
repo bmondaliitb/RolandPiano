@@ -42,6 +42,19 @@ class Song:
     path: Path
     notes: tuple[NoteEvent, ...]
     duration: float
+    playback_events: tuple["PlaybackEvent", ...] = tuple()
+
+
+@dataclass(frozen=True)
+class PlaybackEvent:
+    time: float
+    kind: str
+    channel: int
+    note: int = 0
+    velocity: int = 0
+    control: int = 0
+    value: int = 0
+    note_id: int = -1
 
 
 @dataclass(frozen=True)
@@ -128,7 +141,14 @@ def load_song(source: PathLike) -> Song:
     midi = mido.MidiFile(midi_path)
     notes = tuple(_extract_notes(midi))
     duration = max((note.end for note in notes), default=midi.length if midi.length else 0.0)
-    return Song(path=midi_path, notes=notes, duration=duration)
+    playback_events = tuple(_build_playback_events(midi, notes))
+    return Song(path=midi_path, notes=notes, duration=duration, playback_events=playback_events)
+
+
+def shape_velocity(velocity: int, dynamics_percent: int) -> int:
+    if velocity <= 0:
+        return 0
+    return max(1, min(127, round(velocity * dynamics_percent / 100)))
 
 
 def build_practice_steps(song: Song, chord_tolerance: float = 0.04) -> Tuple[PracticeStep, ...]:
@@ -220,6 +240,9 @@ def _extract_notes(midi: mido.MidiFile) -> Iterable[NoteEvent]:
     for message in midi:
         absolute_seconds += message.time
 
+        if hasattr(message, "channel") and message.channel == 9:
+            continue
+
         if message.type == "note_on" and message.velocity > 0:
             active.setdefault((message.channel, message.note), []).append((absolute_seconds, message.velocity))
             continue
@@ -247,6 +270,47 @@ def _extract_notes(midi: mido.MidiFile) -> Iterable[NoteEvent]:
             events.append(NoteEvent(note=note, start=start, end=absolute_seconds, velocity=velocity, channel=channel))
 
     return sorted(events, key=lambda event: (event.start, event.note))
+
+
+def _build_playback_events(midi: mido.MidiFile, notes: Tuple[NoteEvent, ...]) -> Iterable[PlaybackEvent]:
+    events: List[PlaybackEvent] = []
+    for note_id, note in enumerate(notes):
+        events.append(
+            PlaybackEvent(
+                time=note.start,
+                kind="note_on",
+                channel=note.channel,
+                note=note.note,
+                velocity=note.velocity,
+                note_id=note_id,
+            )
+        )
+        events.append(
+            PlaybackEvent(
+                time=note.end,
+                kind="note_off",
+                channel=note.channel,
+                note=note.note,
+                note_id=note_id,
+            )
+        )
+
+    absolute_seconds = 0.0
+    for message in midi:
+        absolute_seconds += message.time
+        if message.type == "control_change" and message.channel != 9 and message.control in {64, 66, 67}:
+            events.append(
+                PlaybackEvent(
+                    time=absolute_seconds,
+                    kind="control_change",
+                    channel=message.channel,
+                    control=message.control,
+                    value=message.value,
+                )
+            )
+
+    priority = {"note_off": 0, "control_change": 1, "note_on": 2}
+    return sorted(events, key=lambda event: (event.time, priority[event.kind], event.note))
 
 
 def open_output_port(name: Optional[str] = None):

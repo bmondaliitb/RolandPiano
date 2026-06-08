@@ -22,6 +22,7 @@ from .song_trainer import (
     open_input_port,
     open_output_port,
     practice_step_matches,
+    shape_velocity,
     suggest_fingering,
 )
 
@@ -43,6 +44,7 @@ class PianoTrainerApp(tk.Tk):
         self.started_at = 0.0
         self.paused_at = 0.0
         self.tempo = tk.DoubleVar(value=1.0)
+        self.dynamics = tk.IntVar(value=85)
         self.follow = tk.BooleanVar(value=True)
         self.send_to_piano = tk.BooleanVar(value=send_to_piano)
         self.practice_mode = tk.BooleanVar(value=False)
@@ -57,7 +59,8 @@ class PianoTrainerApp(tk.Tk):
         self.output_port = None
         self.input_port = None
         self.input_messages: queue.Queue = queue.Queue()
-        self.sent_note_ons: Set[Tuple[int, int]] = set()
+        self.active_output_notes: Dict[Tuple[int, int], int] = {}
+        self.playback_event_index = 0
         self.pressed_notes: Set[int] = set()
         self.practice_steps: Tuple[PracticeStep, ...] = tuple()
         self.practice_index = 0
@@ -89,6 +92,17 @@ class PianoTrainerApp(tk.Tk):
         )
         self.tempo_label = ttk.Label(toolbar, text="100%")
         self.tempo_label.grid(row=0, column=5, padx=(0, 12))
+        ttk.Label(toolbar, text="Dynamics").grid(row=0, column=6, padx=(0, 4))
+        ttk.Scale(
+            toolbar,
+            variable=self.dynamics,
+            from_=50,
+            to=110,
+            orient="horizontal",
+            length=120,
+        ).grid(row=0, column=7, padx=(0, 6))
+        self.dynamics_label = ttk.Label(toolbar, text="85%")
+        self.dynamics_label.grid(row=0, column=8, sticky="e")
 
         ttk.Checkbutton(toolbar, text="Send to Roland", variable=self.send_to_piano).grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(7, 0)
@@ -187,7 +201,7 @@ class PianoTrainerApp(tk.Tk):
         self.practice_waiting = False
         self.pressed_notes.clear()
         self.paused_at = 0.0
-        self.sent_note_ons.clear()
+        self._reset_output_playback(0.0)
         self.clear_loop()
         self.position_scale.configure(to=max(song.duration, 0.1), state="normal")
         self._update_position_display()
@@ -223,14 +237,18 @@ class PianoTrainerApp(tk.Tk):
         if self.send_to_piano.get() and self.output_port is None:
             try:
                 self.output_port = open_output_port()
-            except OSError as exc:
+            except Exception as exc:
                 self.send_to_piano.set(False)
                 messagebox.showwarning("Roland output unavailable", str(exc))
             else:
-                if self.output_port is not None:
-                    return
-                self.send_to_piano.set(False)
-                messagebox.showwarning("Roland output unavailable", "No Roland Digital Piano MIDI output port was found.")
+                if self.output_port is None:
+                    self.send_to_piano.set(False)
+                    messagebox.showwarning(
+                        "Roland output unavailable",
+                        "No Roland Digital Piano MIDI output port was found.",
+                    )
+        if self.send_to_piano.get() and self.output_port is not None:
+            self._reset_output_playback(self.paused_at)
 
     def stop_playback(self, send_off: bool = False) -> None:
         if self.playing:
@@ -244,7 +262,7 @@ class PianoTrainerApp(tk.Tk):
     def restart(self) -> None:
         self.stop_playback(send_off=True)
         self.paused_at = 0.0
-        self.sent_note_ons.clear()
+        self._reset_output_playback(0.0)
         self.pressed_notes.clear()
         self.practice_index = 0
         self.practice_waiting = False
@@ -265,12 +283,12 @@ class PianoTrainerApp(tk.Tk):
         if self.song is None:
             return
         self.paused_at = min(max(0.0, position), self.song.duration)
-        self.sent_note_ons.clear()
+        self._all_notes_off()
+        self._reset_output_playback(self.paused_at)
         self._set_practice_index_for_time(self.paused_at)
         self.practice_waiting = False
         if self.playing:
             self.started_at = time.monotonic() - (self.paused_at / self.tempo.get())
-        self._all_notes_off()
         self._update_position_display()
         self._update_status()
         self.draw()
@@ -284,6 +302,7 @@ class PianoTrainerApp(tk.Tk):
 
     def _tick(self) -> None:
         self.tempo_label.configure(text=f"{round(self.tempo.get() * 100):d}%")
+        self.dynamics_label.configure(text=f"{self.dynamics.get()}%")
         if self.song and self.playing:
             now = self.current_time()
             if self._loop_is_active() and now >= self.loop_end:
@@ -292,7 +311,7 @@ class PianoTrainerApp(tk.Tk):
             if self.practice_mode.get():
                 now = self._update_practice_wait(now)
             else:
-                self._send_due_notes(now)
+                self._send_due_events(now)
             self._drain_input_messages()
             if self.playing and now >= self.song.duration:
                 self.paused_at = self.song.duration
@@ -357,6 +376,7 @@ class PianoTrainerApp(tk.Tk):
         self._all_notes_off()
         self.pressed_notes.clear()
         self._move_to_loop_start()
+        self._reset_output_playback(self.loop_start)
         self.started_at = time.monotonic() - (self.loop_start / self.tempo.get())
         self._update_status()
 
@@ -372,17 +392,49 @@ class PianoTrainerApp(tk.Tk):
         state = "on" if self.loop_enabled.get() else "off"
         self.loop_text.set(f"Loop: A {self.loop_start:.2f}s - B {self.loop_end:.2f}s ({state})")
 
-    def _send_due_notes(self, now: float) -> None:
+    def _send_due_events(self, now: float) -> None:
         if not self.send_to_piano.get() or self.output_port is None or self.song is None:
             return
-        for note in self.song.notes:
-            key = (note.channel, note.note)
-            if note.start <= now <= note.end and key not in self.sent_note_ons:
-                self.output_port.send(mido.Message("note_on", note=note.note, velocity=max(note.velocity, 30), channel=note.channel))
-                self.sent_note_ons.add(key)
-            elif now > note.end and key in self.sent_note_ons:
-                self.output_port.send(mido.Message("note_off", note=note.note, velocity=0, channel=note.channel))
-                self.sent_note_ons.remove(key)
+        events = self.song.playback_events
+        while self.playback_event_index < len(events) and events[self.playback_event_index].time <= now:
+            event = events[self.playback_event_index]
+            self.playback_event_index += 1
+            if event.kind == "control_change":
+                self.output_port.send(
+                    mido.Message(
+                        "control_change",
+                        control=event.control,
+                        value=event.value,
+                        channel=event.channel,
+                    )
+                )
+                continue
+
+            key = (event.channel, event.note)
+            if event.kind == "note_on":
+                if key in self.active_output_notes:
+                    self.output_port.send(
+                        mido.Message("note_off", note=event.note, velocity=0, channel=event.channel)
+                    )
+                velocity = shape_velocity(event.velocity, self.dynamics.get())
+                self.output_port.send(
+                    mido.Message("note_on", note=event.note, velocity=velocity, channel=event.channel)
+                )
+                self.active_output_notes[key] = event.note_id
+            elif self.active_output_notes.get(key) == event.note_id:
+                self.output_port.send(
+                    mido.Message("note_off", note=event.note, velocity=0, channel=event.channel)
+                )
+                self.active_output_notes.pop(key, None)
+
+    def _reset_output_playback(self, position: float) -> None:
+        self.active_output_notes.clear()
+        self.playback_event_index = 0
+        if self.song is None:
+            return
+        events = self.song.playback_events
+        while self.playback_event_index < len(events) and events[self.playback_event_index].time < position:
+            self.playback_event_index += 1
 
     def _practice_mode_changed(self) -> None:
         self.stop_playback(send_off=True)
@@ -490,9 +542,16 @@ class PianoTrainerApp(tk.Tk):
 
     def _all_notes_off(self) -> None:
         if self.output_port is not None:
-            for channel, note in list(self.sent_note_ons):
+            for channel, note in list(self.active_output_notes):
                 self.output_port.send(mido.Message("note_off", note=note, velocity=0, channel=channel))
-        self.sent_note_ons.clear()
+            channels = {event.channel for event in self.song.playback_events} if self.song else {0}
+            for channel in channels:
+                for control in (64, 66, 67):
+                    self.output_port.send(
+                        mido.Message("control_change", control=control, value=0, channel=channel)
+                    )
+                self.output_port.send(mido.Message("control_change", control=123, value=0, channel=channel))
+        self.active_output_notes.clear()
 
     def draw(self) -> None:
         self.roll.delete("all")

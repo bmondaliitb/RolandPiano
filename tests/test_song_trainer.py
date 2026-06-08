@@ -10,6 +10,7 @@ from src.roland_piano.song_trainer import (
     load_song,
     note_name,
     practice_step_matches,
+    shape_velocity,
     suggest_fingering,
 )
 
@@ -79,6 +80,45 @@ class TestSongTrainer(unittest.TestCase):
 
         self.assertEqual(left[0].label, "L1")
         self.assertEqual(right[0].label, "R1")
+
+    def test_playback_events_preserve_pedal_and_note_identity(self):
+        path = Path(tempfile.gettempdir()) / "roland_piano_trainer_playback_test.mid"
+        midi = mido.MidiFile(ticks_per_beat=480)
+        track = mido.MidiTrack()
+        midi.tracks.append(track)
+        track.append(mido.Message("control_change", control=64, value=127, time=0))
+        track.append(mido.Message("note_on", note=60, velocity=20, time=0))
+        track.append(mido.Message("note_on", note=60, velocity=40, time=120))
+        track.append(mido.Message("note_off", note=60, velocity=0, time=120))
+        track.append(mido.Message("note_off", note=60, velocity=0, time=120))
+        track.append(mido.Message("control_change", control=64, value=0, time=0))
+        midi.save(path)
+
+        events = load_song(path).playback_events
+
+        note_ons = [event for event in events if event.kind == "note_on"]
+        pedal = [event.value for event in events if event.kind == "control_change" and event.control == 64]
+        self.assertEqual(len({event.note_id for event in note_ons}), 2)
+        self.assertEqual(pedal, [127, 0])
+
+    def test_percussion_channel_is_not_treated_as_piano(self):
+        path = Path(tempfile.gettempdir()) / "roland_piano_trainer_percussion_test.mid"
+        midi = mido.MidiFile(ticks_per_beat=480)
+        track = mido.MidiTrack()
+        midi.tracks.append(track)
+        track.append(mido.Message("note_on", channel=9, note=36, velocity=127, time=0))
+        track.append(mido.Message("note_off", channel=9, note=36, velocity=0, time=120))
+        track.append(mido.Message("note_on", channel=0, note=60, velocity=80, time=0))
+        track.append(mido.Message("note_off", channel=0, note=60, velocity=0, time=120))
+        midi.save(path)
+
+        song = load_song(path)
+
+        self.assertEqual([note.note for note in song.notes], [60])
+
+    def test_velocity_shaping_does_not_force_quiet_notes_louder(self):
+        self.assertEqual(shape_velocity(20, 85), 17)
+        self.assertEqual(shape_velocity(127, 110), 127)
 
 
 if __name__ == "__main__":
