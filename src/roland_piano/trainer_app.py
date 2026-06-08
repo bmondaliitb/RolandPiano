@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import queue
 import threading
 import time
 import tkinter as tk
@@ -10,7 +11,18 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import mido
 
-from .song_trainer import Song, SongConversionError, is_black_key, load_song, note_name, open_output_port
+from .song_trainer import (
+    PracticeStep,
+    Song,
+    SongConversionError,
+    build_practice_steps,
+    is_black_key,
+    load_song,
+    note_name,
+    open_input_port,
+    open_output_port,
+    practice_step_matches,
+)
 
 
 LOW_NOTE = 21
@@ -32,8 +44,15 @@ class PianoTrainerApp(tk.Tk):
         self.tempo = tk.DoubleVar(value=1.0)
         self.follow = tk.BooleanVar(value=True)
         self.send_to_piano = tk.BooleanVar(value=send_to_piano)
+        self.practice_mode = tk.BooleanVar(value=False)
         self.output_port = None
+        self.input_port = None
+        self.input_messages: queue.Queue = queue.Queue()
         self.sent_note_ons: Set[Tuple[int, int]] = set()
+        self.pressed_notes: Set[int] = set()
+        self.practice_steps: Tuple[PracticeStep, ...] = tuple()
+        self.practice_index = 0
+        self.practice_waiting = False
         self.preview_seconds = 5.0
 
         self._build_ui()
@@ -48,7 +67,7 @@ class PianoTrainerApp(tk.Tk):
 
         toolbar = ttk.Frame(self, padding=(10, 8))
         toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(7, weight=1)
+        toolbar.columnconfigure(8, weight=1)
 
         ttk.Button(toolbar, text="Open", command=self.open_file).grid(row=0, column=0, padx=(0, 6))
         self.play_button = ttk.Button(toolbar, text="Play", command=self.toggle_playback)
@@ -63,10 +82,16 @@ class PianoTrainerApp(tk.Tk):
         self.tempo_label.grid(row=0, column=5, padx=(0, 12))
 
         ttk.Checkbutton(toolbar, text="Send to Roland", variable=self.send_to_piano).grid(row=0, column=6, padx=(0, 10))
-        ttk.Checkbutton(toolbar, text="Follow", variable=self.follow).grid(row=0, column=7, sticky="w")
+        ttk.Checkbutton(
+            toolbar,
+            text="Wait for keys",
+            variable=self.practice_mode,
+            command=self._practice_mode_changed,
+        ).grid(row=0, column=7, padx=(0, 10))
+        ttk.Checkbutton(toolbar, text="Follow", variable=self.follow).grid(row=0, column=8, sticky="w")
 
-        self.status = ttk.Label(toolbar, text="Open a MIDI file, or an audio file if Basic Pitch is installed.")
-        self.status.grid(row=0, column=8, sticky="e")
+        self.status = ttk.Label(toolbar, text="Open a MIDI file to begin.")
+        self.status.grid(row=1, column=0, columnspan=9, sticky="ew", pady=(7, 0))
 
         self.roll = tk.Canvas(self, background="#15171a", highlightthickness=0)
         self.roll.grid(row=1, column=0, sticky="nsew")
@@ -107,10 +132,14 @@ class PianoTrainerApp(tk.Tk):
 
     def _load_finished(self, song: Song) -> None:
         self.song = song
+        self.practice_steps = build_practice_steps(song)
+        self.practice_index = 0
+        self.practice_waiting = False
+        self.pressed_notes.clear()
         self.paused_at = 0.0
         self.sent_note_ons.clear()
         self.play_button.configure(state="normal", text="Play")
-        self.status.configure(text=f"{song.path.name}: {len(song.notes)} notes, {song.duration:.1f}s")
+        self._update_status()
         self.draw()
 
     def _load_failed(self, exc: BaseException) -> None:
@@ -128,9 +157,14 @@ class PianoTrainerApp(tk.Tk):
             self.start_playback()
 
     def start_playback(self) -> None:
+        if self.practice_mode.get() and not self._ensure_input_port():
+            return
         self.playing = True
         self.started_at = time.monotonic() - (self.paused_at / self.tempo.get())
         self.play_button.configure(text="Pause")
+        self._update_status()
+        if self.practice_mode.get():
+            return
         if self.send_to_piano.get() and self.output_port is None:
             try:
                 self.output_port = open_output_port()
@@ -150,11 +184,16 @@ class PianoTrainerApp(tk.Tk):
         self.play_button.configure(text="Play")
         if send_off:
             self._all_notes_off()
+        self._update_status()
 
     def restart(self) -> None:
         self.stop_playback(send_off=True)
         self.paused_at = 0.0
         self.sent_note_ons.clear()
+        self.pressed_notes.clear()
+        self.practice_index = 0
+        self.practice_waiting = False
+        self._update_status()
         self.draw()
 
     def seek_relative(self, seconds: float) -> None:
@@ -162,12 +201,16 @@ class PianoTrainerApp(tk.Tk):
             return
         self.paused_at = min(max(0.0, self.current_time() + seconds), self.song.duration)
         self.sent_note_ons.clear()
+        self._set_practice_index_for_time(self.paused_at)
+        self.practice_waiting = False
         if self.playing:
             self.started_at = time.monotonic() - (self.paused_at / self.tempo.get())
         self._all_notes_off()
         self.draw()
 
     def current_time(self) -> float:
+        if self.practice_mode.get() and self.practice_waiting:
+            return self.paused_at
         if self.playing:
             return max(0.0, (time.monotonic() - self.started_at) * self.tempo.get())
         return self.paused_at
@@ -176,11 +219,17 @@ class PianoTrainerApp(tk.Tk):
         self.tempo_label.configure(text=f"{round(self.tempo.get() * 100):d}%")
         if self.song and self.playing:
             now = self.current_time()
-            self._send_due_notes(now)
-            if now >= self.song.duration:
+            if self.practice_mode.get():
+                now = self._update_practice_wait(now)
+            else:
+                self._send_due_notes(now)
+            self._drain_input_messages()
+            if self.playing and now >= self.song.duration:
                 self.paused_at = self.song.duration
                 self.stop_playback(send_off=True)
             self.draw()
+        else:
+            self._drain_input_messages()
         self.after(16, self._tick)
 
     def _send_due_notes(self, now: float) -> None:
@@ -194,6 +243,105 @@ class PianoTrainerApp(tk.Tk):
             elif now > note.end and key in self.sent_note_ons:
                 self.output_port.send(mido.Message("note_off", note=note.note, velocity=0, channel=note.channel))
                 self.sent_note_ons.remove(key)
+
+    def _practice_mode_changed(self) -> None:
+        self.stop_playback(send_off=True)
+        self.paused_at = 0.0
+        self.practice_index = 0
+        self.practice_waiting = False
+        self.pressed_notes.clear()
+        self._update_status()
+        self.draw()
+
+    def _ensure_input_port(self) -> bool:
+        if self.input_port is not None:
+            return True
+        try:
+            self.input_port = open_input_port(self.input_messages.put)
+        except Exception as exc:
+            messagebox.showwarning("Piano input unavailable", str(exc))
+            return False
+        if self.input_port is None:
+            messagebox.showwarning(
+                "Piano input unavailable",
+                "No Roland piano MIDI input was found. Connect the FP-10 by USB and restart the app.",
+            )
+            return False
+        return True
+
+    def _drain_input_messages(self) -> None:
+        changed = False
+        while True:
+            try:
+                message = self.input_messages.get_nowait()
+            except queue.Empty:
+                break
+            if message.type == "note_on" and message.velocity > 0:
+                self.pressed_notes.add(message.note)
+                changed = True
+                self._try_complete_practice_step()
+            elif message.type == "note_off" or (message.type == "note_on" and message.velocity == 0):
+                self.pressed_notes.discard(message.note)
+                changed = True
+                self._try_complete_practice_step()
+        if changed and self.practice_mode.get():
+            self.draw()
+
+    def _update_practice_wait(self, now: float) -> float:
+        if self.practice_index >= len(self.practice_steps):
+            return now
+        step = self.practice_steps[self.practice_index]
+        if now >= step.start:
+            self.paused_at = step.start
+            self.practice_waiting = True
+            self._update_status()
+            return step.start
+        return now
+
+    def _try_complete_practice_step(self) -> None:
+        if not self.playing or not self.practice_mode.get() or not self.practice_waiting:
+            return
+        step = self._current_practice_step()
+        if step is None or not practice_step_matches(step, self.pressed_notes):
+            return
+
+        self.practice_index += 1
+        self.practice_waiting = False
+        if self.practice_index >= len(self.practice_steps):
+            self.paused_at = self.song.duration if self.song else self.paused_at
+            self.playing = False
+            self.play_button.configure(text="Play")
+        else:
+            self.started_at = time.monotonic() - (self.paused_at / self.tempo.get())
+        self._update_status()
+
+    def _current_practice_step(self) -> Optional[PracticeStep]:
+        if 0 <= self.practice_index < len(self.practice_steps):
+            return self.practice_steps[self.practice_index]
+        return None
+
+    def _set_practice_index_for_time(self, position: float) -> None:
+        self.practice_index = len(self.practice_steps)
+        for index, step in enumerate(self.practice_steps):
+            if step.start >= position:
+                self.practice_index = index
+                break
+
+    def _update_status(self) -> None:
+        if self.song is None:
+            self.status.configure(text="Open a MIDI file to begin.")
+            return
+        if self.practice_mode.get():
+            step = self._current_practice_step()
+            if step is None:
+                text = f"{self.song.path.name}: practice complete"
+            elif self.practice_waiting:
+                text = f"Play: {' + '.join(step.names)}"
+            else:
+                text = f"{self.song.path.name}: next {' + '.join(step.names)}"
+        else:
+            text = f"{self.song.path.name}: {len(self.song.notes)} notes, {self.song.duration:.1f}s"
+        self.status.configure(text=text)
 
     def _all_notes_off(self) -> None:
         if self.output_port is not None:
@@ -233,7 +381,18 @@ class PianoTrainerApp(tk.Tk):
             self.roll.create_rectangle(x1, y1, x2, y2, fill=fill, outline="")
 
         next_notes = [note for note in self.song.notes if note.start >= now][:8]
-        if next_notes:
+        step = self._current_practice_step() if self.practice_mode.get() else None
+        if self.practice_waiting and step is not None:
+            text = " + ".join(step.names)
+            self.roll.create_text(
+                width / 2,
+                height - 68,
+                text=f"PLAY  {text}",
+                fill="#f2c14e",
+                anchor="s",
+                font=("TkDefaultFont", 20, "bold"),
+            )
+        elif next_notes:
             text = "  ".join(note.name for note in next_notes)
             self.roll.create_text(14, 16, text=f"Next: {text}", fill="#e8e8e8", anchor="nw", font=("TkDefaultFont", 14))
         self.roll.create_text(width - 14, 16, text=f"{now:.1f} / {self.song.duration:.1f}s", fill="#e8e8e8", anchor="ne")
@@ -242,6 +401,7 @@ class PianoTrainerApp(tk.Tk):
         width = max(self.keyboard.winfo_width(), 1)
         height = max(self.keyboard.winfo_height(), 1)
         active = self._active_notes()
+        expected = set(self._current_practice_step().notes) if self.practice_waiting and self._current_practice_step() else set()
         white_notes = [note for note in range(LOW_NOTE, HIGH_NOTE + 1) if note % 12 in WHITE_KEY_PATTERN]
         white_width = width / len(white_notes)
         white_positions: Dict[int, Tuple[float, float]] = {}
@@ -250,7 +410,7 @@ class PianoTrainerApp(tk.Tk):
             x1 = index * white_width
             x2 = x1 + white_width
             white_positions[note] = (x1, x2)
-            fill = "#f2c14e" if note in active else "#f7f7f3"
+            fill = self._key_fill(note, active, expected, black=False)
             self.keyboard.create_rectangle(x1, 0, x2, height, fill=fill, outline="#444")
             if note % 12 == 0:
                 self.keyboard.create_text((x1 + x2) / 2, height - 16, text=note_name(note), fill="#30343a", font=("TkDefaultFont", 9))
@@ -262,8 +422,20 @@ class PianoTrainerApp(tk.Tk):
             x1, x2 = white_positions[previous_white]
             black_width = white_width * 0.62
             center = x2
-            fill = "#f2c14e" if note in active else "#15171a"
+            fill = self._key_fill(note, active, expected, black=True)
             self.keyboard.create_rectangle(center - black_width / 2, 0, center + black_width / 2, height * 0.62, fill=fill, outline="#111")
+
+    def _key_fill(self, note: int, active: Set[int], expected: Set[int], black: bool) -> str:
+        if self.practice_mode.get():
+            if note in self.pressed_notes and note not in expected:
+                return "#d64545"
+            if note in self.pressed_notes and note in expected:
+                return "#27ae60"
+            if note in expected:
+                return "#2f80ed"
+        if note in active:
+            return "#f2c14e"
+        return "#15171a" if black else "#f7f7f3"
 
     def _active_notes(self) -> Set[int]:
         if self.song is None:
@@ -275,12 +447,14 @@ class PianoTrainerApp(tk.Tk):
         self._all_notes_off()
         if self.output_port is not None:
             self.output_port.close()
+        if self.input_port is not None:
+            self.input_port.close()
         super().destroy()
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Show how to play MIDI/audio songs on a Roland FP-10 style keyboard.")
-    parser.add_argument("song", nargs="?", help="MIDI file, or audio file when basic-pitch is installed")
+    parser.add_argument("song", nargs="?", help="MIDI file, or audio file when an external converter is configured")
     parser.add_argument("--send-to-piano", action="store_true", help="play MIDI notes through the first Roland output port")
     args = parser.parse_args(argv)
 

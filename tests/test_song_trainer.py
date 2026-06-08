@@ -4,7 +4,13 @@ from pathlib import Path
 
 import mido
 
-from src.roland_piano.song_trainer import load_song, note_name
+from src.roland_piano.song_trainer import (
+    PracticeStep,
+    build_practice_steps,
+    load_song,
+    note_name,
+    practice_step_matches,
+)
 
 
 class TestSongTrainer(unittest.TestCase):
@@ -27,9 +33,37 @@ class TestSongTrainer(unittest.TestCase):
         self.assertAlmostEqual(song.notes[0].duration, 0.5, places=3)
         self.assertAlmostEqual(song.duration, 0.75, places=3)
 
+    def test_practice_steps_group_notes_that_start_together(self):
+        path = Path(tempfile.gettempdir()) / "roland_piano_trainer_chords_test.mid"
+        midi = mido.MidiFile(ticks_per_beat=480)
+        track = mido.MidiTrack()
+        midi.tracks.append(track)
+        track.append(mido.Message("note_on", note=60, velocity=80, time=0))
+        track.append(mido.Message("note_on", note=64, velocity=80, time=0))
+        track.append(mido.Message("note_on", note=67, velocity=80, time=0))
+        track.append(mido.Message("note_off", note=60, velocity=0, time=240))
+        track.append(mido.Message("note_off", note=64, velocity=0, time=0))
+        track.append(mido.Message("note_off", note=67, velocity=0, time=0))
+        track.append(mido.Message("note_on", note=62, velocity=80, time=240))
+        track.append(mido.Message("note_off", note=62, velocity=0, time=240))
+        midi.save(path)
+
+        steps = build_practice_steps(load_song(path))
+
+        self.assertEqual(steps[0].notes, (60, 64, 67))
+        self.assertEqual(steps[0].names, ("C4", "E4", "G4"))
+        self.assertEqual(steps[1].notes, (62,))
+
     def test_note_name(self):
         self.assertEqual(note_name(21), "A0")
         self.assertEqual(note_name(108), "C8")
+
+    def test_practice_step_requires_an_exact_match(self):
+        step = PracticeStep(start=1.0, notes=(60, 64, 67))
+
+        self.assertFalse(practice_step_matches(step, {60, 64}))
+        self.assertFalse(practice_step_matches(step, {60, 64, 67, 72}))
+        self.assertTrue(practice_step_matches(step, {60, 64, 67}))
 
 
 if __name__ == "__main__":

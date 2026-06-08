@@ -41,6 +41,15 @@ Run the app:
 roland-piano-trainer
 ```
 
+To practice in wait mode:
+
+1. Connect the FP-10 to Fedora by USB and open a MIDI song.
+2. Enable `Wait for keys`.
+3. Press `Play`.
+4. Play the blue target key or chord. The song remains stopped until the physically held keys exactly match the target.
+
+Correct pressed keys turn green. Extra incorrect keys turn red. For chords, all chord notes must be held together before the song advances.
+
 Or open a song immediately:
 
 ```bash

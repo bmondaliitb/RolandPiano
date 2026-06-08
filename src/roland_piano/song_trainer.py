@@ -7,7 +7,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import mido
 
@@ -42,6 +42,16 @@ class Song:
     path: Path
     notes: tuple[NoteEvent, ...]
     duration: float
+
+
+@dataclass(frozen=True)
+class PracticeStep:
+    start: float
+    notes: tuple[int, ...]
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(note_name(note) for note in self.notes)
 
 
 def note_name(note: int) -> str:
@@ -110,6 +120,31 @@ def load_song(source: PathLike) -> Song:
     return Song(path=midi_path, notes=notes, duration=duration)
 
 
+def build_practice_steps(song: Song, chord_tolerance: float = 0.04) -> Tuple[PracticeStep, ...]:
+    steps: List[PracticeStep] = []
+    group_start: Optional[float] = None
+    group_notes: Set[int] = set()
+
+    for event in song.notes:
+        if group_start is None or event.start - group_start <= chord_tolerance:
+            if group_start is None:
+                group_start = event.start
+            group_notes.add(event.note)
+            continue
+
+        steps.append(PracticeStep(start=group_start, notes=tuple(sorted(group_notes))))
+        group_start = event.start
+        group_notes = {event.note}
+
+    if group_start is not None:
+        steps.append(PracticeStep(start=group_start, notes=tuple(sorted(group_notes))))
+    return tuple(steps)
+
+
+def practice_step_matches(step: PracticeStep, pressed_notes: Set[int]) -> bool:
+    return pressed_notes == set(step.notes)
+
+
 def _midi_files(directory: Path) -> List[Path]:
     return [path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in MIDI_EXTENSIONS]
 
@@ -163,4 +198,17 @@ def open_output_port(name: Optional[str] = None):
     roland_ports = [port for port in mido.get_output_names() if port.startswith("Roland Digital Piano")]
     if roland_ports:
         return mido.open_output(roland_ports[0])
+    return None
+
+
+def open_input_port(callback: Callable, name: Optional[str] = None):
+    if name:
+        return mido.open_input(name, callback=callback)
+
+    input_names = mido.get_input_names()
+    roland_ports = [port for port in input_names if "roland" in port.lower()]
+    if roland_ports:
+        return mido.open_input(roland_ports[0], callback=callback)
+    if len(input_names) == 1:
+        return mido.open_input(input_names[0], callback=callback)
     return None
