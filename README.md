@@ -43,6 +43,16 @@ roland-piano-trainer
 
 The application icon source and Fedora/GNOME-compatible PNG sizes are available under `assets/icons/`. The packaged app also uses the icon in its window and task switcher.
 
+When using a virtual environment, install the GNOME desktop launcher while that environment is active:
+
+```bash
+source /path/to/venv/bin/activate
+python -m pip install -e .
+./packaging/install-desktop-launcher.sh
+```
+
+The installer writes `~/.local/share/applications/roland-piano-trainer.desktop` with the virtual environment's absolute Python path. Run it again after replacing or moving the virtual environment.
+
 To practice in wait mode:
 
 1. Connect the FP-10 to Fedora by USB and open a MIDI song.

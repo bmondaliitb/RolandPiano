@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Roland Piano Trainer
+GenericName=Piano Learning App
+Comment=Practice MIDI songs with guided keys, fingering, and wait mode
+Exec=/absolute/path/to/venv/bin/python -m roland_piano.trainer_app
+Path=/mnt/nvme0n1p4/CLion-Pycharm-projects/PycharmProjects/roland/RolandPiano
+Icon=/home/bmondal/.local/share/icons/hicolor/256x256/apps/roland-piano-trainer.png
+Terminal=false
+Categories=Education;Music;
+Keywords=Piano;MIDI;Roland;Practice;Music;
+StartupNotify=true
+StartupWMClass=Roland FP-10 Piano Trainer
