@@ -7,7 +7,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
 
 import mido
 
@@ -22,6 +22,8 @@ class SongConversionError(RuntimeError):
 
 @dataclass(frozen=True)
 class NoteEvent:
+    __slots__ = ("note", "start", "end", "velocity", "channel")
+
     note: int
     start: float
     end: float
@@ -39,14 +41,15 @@ class NoteEvent:
 
 @dataclass(frozen=True)
 class Song:
+    __slots__ = ("path", "notes", "duration", "playback_events")
+
     path: Path
     notes: tuple[NoteEvent, ...]
     duration: float
-    playback_events: tuple["PlaybackEvent", ...] = tuple()
+    playback_events: tuple["PlaybackEvent", ...]
 
 
-@dataclass(frozen=True)
-class PlaybackEvent:
+class PlaybackEvent(NamedTuple):
     time: float
     kind: str
     channel: int
@@ -59,6 +62,8 @@ class PlaybackEvent:
 
 @dataclass(frozen=True)
 class PracticeStep:
+    __slots__ = ("start", "notes")
+
     start: float
     notes: tuple[int, ...]
 
@@ -69,6 +74,8 @@ class PracticeStep:
 
 @dataclass(frozen=True)
 class FingerSuggestion:
+    __slots__ = ("note", "hand", "finger")
+
     note: int
     hand: str
     finger: int

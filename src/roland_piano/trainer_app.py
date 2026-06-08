@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left, bisect_right
 from pathlib import Path
 import queue
 import threading
@@ -82,9 +83,19 @@ class PianoTrainerApp(tk.Tk):
         self.playback_event_index = 0
         self.pressed_notes: Set[int] = set()
         self.practice_steps: Tuple[PracticeStep, ...] = tuple()
+        self.practice_step_starts: Tuple[float, ...] = tuple()
         self.practice_index = 0
         self.practice_waiting = False
         self.preview_seconds = 5.0
+        self.note_starts: Tuple[float, ...] = tuple()
+        self.playback_event_times: Tuple[float, ...] = tuple()
+        self.max_note_duration = 0.0
+        self.last_render_time = 0.0
+        self.render_interval = 1.0 / 24.0
+        self.last_position_update_time = 0.0
+        self.position_update_interval = 1.0 / 20.0
+        self.control_label_signature = None
+        self.keyboard_signature = None
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._close_app)
@@ -327,7 +338,11 @@ class PianoTrainerApp(tk.Tk):
 
     def _load_finished(self, song: Song) -> None:
         self.song = song
+        self.note_starts = tuple(note.start for note in song.notes)
+        self.playback_event_times = tuple(event.time for event in song.playback_events)
+        self.max_note_duration = max((note.duration for note in song.notes), default=0.0)
         self.practice_steps = build_practice_steps(song)
+        self.practice_step_starts = tuple(step.start for step in self.practice_steps)
         self.practice_index = 0
         self.practice_waiting = False
         self.pressed_notes.clear()
@@ -338,7 +353,7 @@ class PianoTrainerApp(tk.Tk):
         if self.pending_song_state is not None:
             self._restore_song_state(self.pending_song_state)
             self.pending_song_state = None
-        self._update_position_display()
+        self._update_position_display(force=True)
         self.play_button.configure(state="normal", text="Play")
         self._update_status()
         self.draw()
@@ -430,7 +445,7 @@ class PianoTrainerApp(tk.Tk):
         self.practice_waiting = False
         if self.playing:
             self.started_at = time.monotonic() - (self.paused_at / self.tempo.get())
-        self._update_position_display()
+        self._update_position_display(force=True)
         self._update_status()
         self.draw()
 
@@ -442,9 +457,7 @@ class PianoTrainerApp(tk.Tk):
         return self.paused_at
 
     def _tick(self) -> None:
-        self.tempo_label.configure(text=f"{round(self.tempo.get() * 100):d}%")
-        self.dynamics_label.configure(text=f"{self.dynamics.get()}%")
-        self.piano_volume_label.configure(text=str(round(self.piano_volume.get())))
+        self._update_control_labels()
         if self.song and self.playing:
             now = self.current_time()
             if self._loop_is_active() and now >= self.loop_end:
@@ -458,11 +471,24 @@ class PianoTrainerApp(tk.Tk):
             if self.playing and now >= self.song.duration:
                 self.paused_at = self.song.duration
                 self.stop_playback(send_off=True)
-            self.draw()
+            self._draw_playback_frame(now)
         else:
             self._drain_input_messages()
         self._update_position_display()
-        self.after(16, self._tick)
+        self.after(16 if self.playing else 50, self._tick)
+
+    def _update_control_labels(self) -> None:
+        signature = (
+            round(self.tempo.get() * 100),
+            self.dynamics.get(),
+            round(self.piano_volume.get()),
+        )
+        if signature == self.control_label_signature:
+            return
+        self.control_label_signature = signature
+        self.tempo_label.configure(text=f"{signature[0]:d}%")
+        self.dynamics_label.configure(text=f"{signature[1]}%")
+        self.piano_volume_label.configure(text=str(signature[2]))
 
     def _piano_volume_changed(self, value: str) -> None:
         volume = max(0, min(100, round(float(value))))
@@ -509,7 +535,11 @@ class PianoTrainerApp(tk.Tk):
             return False
         return True
 
-    def _update_position_display(self) -> None:
+    def _update_position_display(self, force: bool = False) -> None:
+        monotonic_now = time.monotonic()
+        if not force and monotonic_now - self.last_position_update_time < self.position_update_interval:
+            return
+        self.last_position_update_time = monotonic_now
         position = self.current_time()
         self.updating_position = True
         self.position.set(position)
@@ -616,12 +646,7 @@ class PianoTrainerApp(tk.Tk):
 
     def _reset_output_playback(self, position: float) -> None:
         self.active_output_notes.clear()
-        self.playback_event_index = 0
-        if self.song is None:
-            return
-        events = self.song.playback_events
-        while self.playback_event_index < len(events) and events[self.playback_event_index].time < position:
-            self.playback_event_index += 1
+        self.playback_event_index = bisect_left(self.playback_event_times, position)
 
     def _practice_mode_changed(self) -> None:
         self.stop_playback(send_off=True)
@@ -703,11 +728,7 @@ class PianoTrainerApp(tk.Tk):
         return None
 
     def _set_practice_index_for_time(self, position: float) -> None:
-        self.practice_index = len(self.practice_steps)
-        for index, step in enumerate(self.practice_steps):
-            if step.start >= position:
-                self.practice_index = index
-                break
+        self.practice_index = bisect_left(self.practice_step_starts, position)
 
     def _update_status(self) -> None:
         if self.song is None:
@@ -741,10 +762,43 @@ class PianoTrainerApp(tk.Tk):
         self.active_output_notes.clear()
 
     def draw(self) -> None:
+        self.last_render_time = time.monotonic()
         self.roll.delete("all")
         self.keyboard.delete("all")
         self._draw_roll()
         self._draw_keyboard()
+        self.keyboard_signature = self._current_keyboard_signature()
+
+    def _draw_playback_frame(self, now: float) -> None:
+        monotonic_now = time.monotonic()
+        if monotonic_now - self.last_render_time < self.render_interval:
+            return
+        self.last_render_time = monotonic_now
+
+        self.roll.delete("all")
+        self._draw_roll()
+
+        signature = self._current_keyboard_signature(now)
+        if signature != self.keyboard_signature:
+            self.keyboard.delete("all")
+            self._draw_keyboard(now)
+            self.keyboard_signature = signature
+
+    def _current_keyboard_signature(self, now: Optional[float] = None) -> tuple:
+        if now is None:
+            now = self.current_time()
+        step = self._current_practice_step()
+        expected = tuple(step.notes) if self.practice_waiting and step else tuple()
+        finger_labels = tuple(sorted(self._finger_labels(step).items()))
+        return (
+            self.keyboard.winfo_width(),
+            self.keyboard.winfo_height(),
+            tuple(sorted(self._active_notes_at(now))),
+            tuple(sorted(self.pressed_notes)),
+            expected,
+            finger_labels,
+            self.practice_mode.get(),
+        )
 
     def _draw_roll(self) -> None:
         width = max(self.roll.winfo_width(), 1)
@@ -760,7 +814,7 @@ class PianoTrainerApp(tk.Tk):
         pixels_per_second = (height - 70) / self.preview_seconds
         key_width = width / (HIGH_NOTE - LOW_NOTE + 1)
 
-        visible_notes = [note for note in self.song.notes if start_time - 0.4 <= note.end and note.start <= start_time + self.preview_seconds]
+        visible_notes = self._notes_in_window(start_time - 0.4, start_time + self.preview_seconds)
         for note in visible_notes:
             x1 = (note.note - LOW_NOTE) * key_width
             x2 = x1 + key_width
@@ -775,7 +829,8 @@ class PianoTrainerApp(tk.Tk):
         if self.loop_end is not None:
             self._draw_loop_marker(self.loop_end, "B", "#d64545", start_time, pixels_per_second, width, height)
 
-        next_notes = [note for note in self.song.notes if note.start >= now][:8]
+        next_index = bisect_left(self.note_starts, now)
+        next_notes = self.song.notes[next_index : next_index + 8]
         step = self._current_practice_step() if self.practice_mode.get() else None
         if self.practice_waiting and step is not None:
             text = self._step_text(step)
@@ -810,10 +865,10 @@ class PianoTrainerApp(tk.Tk):
         self.roll.create_line(0, y, width, y, fill=color, width=2, dash=(6, 4))
         self.roll.create_text(8, y - 4, text=label, fill=color, anchor="sw", font=("TkDefaultFont", 10, "bold"))
 
-    def _draw_keyboard(self) -> None:
+    def _draw_keyboard(self, now: Optional[float] = None) -> None:
         width = max(self.keyboard.winfo_width(), 1)
         height = max(self.keyboard.winfo_height(), 1)
-        active = self._active_notes()
+        active = self._active_notes_at(self.current_time() if now is None else now)
         step = self._current_practice_step()
         expected = set(step.notes) if self.practice_waiting and step else set()
         finger_labels = self._finger_labels(step)
@@ -889,10 +944,18 @@ class PianoTrainerApp(tk.Tk):
         return "#15171a" if black else "#f7f7f3"
 
     def _active_notes(self) -> Set[int]:
-        if self.song is None:
-            return set()
-        now = self.current_time()
-        return {note.note for note in self.song.notes if note.start <= now <= note.end}
+        return self._active_notes_at(self.current_time())
+
+    def _active_notes_at(self, now: float) -> Set[int]:
+        return {note.note for note in self._notes_in_window(now, now) if note.start <= now <= note.end}
+
+    def _notes_in_window(self, window_start: float, window_end: float):
+        if self.song is None or not self.song.notes:
+            return tuple()
+        first_possible_start = window_start - self.max_note_duration
+        first = bisect_left(self.note_starts, first_possible_start)
+        last = bisect_right(self.note_starts, window_end)
+        return tuple(note for note in self.song.notes[first:last] if note.end >= window_start)
 
     def _session_state(self, include_window: bool) -> dict:
         state = {
