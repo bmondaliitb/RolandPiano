@@ -77,6 +77,14 @@ roland-piano-trainer --send-to-piano path/to/song.mid
 
 When sending MIDI to the Roland, use `Dynamics` to adjust output velocity. The default `85%` softens aggressive MIDI files while preserving their quiet notes and accents. Playback also preserves sustain, sostenuto, and soft-pedal messages, handles repeated pitches independently, and ignores the standard MIDI percussion channel. Piano-only MIDI files will sound cleaner than dense arrangements containing several instrumental parts.
 
+Enable `Play on computer` to hear the MIDI through Fedora's audio output. This uses FluidSynth with PipeWire, PulseAudio, or ALSA and requires a SoundFont:
+
+```bash
+sudo dnf install fluidsynth fluid-soundfont-gm
+```
+
+The computer and Roland outputs can be enabled together. To use a different piano SoundFont, set `PIANO_SOUNDFONT=/path/to/piano.sf2`. You can override the FluidSynth backend with `FLUIDSYNTH_AUDIO_DRIVER=pipewire`, `pulseaudio`, or `alsa`.
+
 Use `Piano volume` to adjust the FP-10 master volume from the app. This is independent of `Dynamics`: master volume changes overall loudness, while Dynamics changes how softly or strongly MIDI notes are played.
 
 The app saves its window size, last song, playhead position, controls, practice options, and loop selection when it closes. The next launch restores that state while remaining paused. State is stored at `$XDG_CONFIG_HOME/roland-piano/trainer-state.json`, or `~/.config/roland-piano/trainer-state.json` when `XDG_CONFIG_HOME` is not set.

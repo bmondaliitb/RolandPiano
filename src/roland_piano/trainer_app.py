@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import mido
 
 from .app_state import load_app_state, load_project, save_app_state, save_project
+from .computer_synth import ComputerSynthError, FluidSynthOutput
 from .roland_address_map import RolandAddressMap
 from .roland_messages import RolandMessageRequest
 from .roland_utils import RolandCmd
@@ -38,7 +39,12 @@ WHITE_KEY_PATTERN = {0, 2, 4, 5, 7, 9, 11}
 
 
 class PianoTrainerApp(tk.Tk):
-    def __init__(self, initial_song: Optional[str] = None, send_to_piano: bool = False) -> None:
+    def __init__(
+        self,
+        initial_song: Optional[str] = None,
+        send_to_piano: bool = False,
+        play_on_computer: bool = False,
+    ) -> None:
         super().__init__()
         self.saved_state = load_app_state()
         self.pending_song_state = None
@@ -67,6 +73,9 @@ class PianoTrainerApp(tk.Tk):
         self.piano_volume_after_id = None
         self.follow = tk.BooleanVar(value=self._saved_bool("follow", True))
         self.send_to_piano = tk.BooleanVar(value=send_to_piano or self._saved_bool("send_to_piano", False))
+        self.play_on_computer = tk.BooleanVar(
+            value=play_on_computer or self._saved_bool("play_on_computer", False)
+        )
         self.practice_mode = tk.BooleanVar(value=self._saved_bool("practice_mode", False))
         self.show_fingers = tk.BooleanVar(value=self._saved_bool("show_fingers", False))
         self.loop_enabled = tk.BooleanVar(value=False)
@@ -77,6 +86,7 @@ class PianoTrainerApp(tk.Tk):
         self.position_text = tk.StringVar(value="0.0s")
         self.updating_position = False
         self.output_port = None
+        self.computer_synth: Optional[FluidSynthOutput] = None
         self.input_port = None
         self.input_messages: queue.Queue = queue.Queue()
         self.active_output_notes: Dict[Tuple[int, int], int] = {}
@@ -164,24 +174,30 @@ class PianoTrainerApp(tk.Tk):
         )
         ttk.Checkbutton(
             toolbar,
+            text="Play on computer",
+            variable=self.play_on_computer,
+            command=self._computer_output_changed,
+        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(
+            toolbar,
             text="Wait for keys",
             variable=self.practice_mode,
             command=self._practice_mode_changed,
-        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=(7, 0))
+        ).grid(row=1, column=4, columnspan=2, sticky="w", pady=(7, 0))
         ttk.Checkbutton(
             toolbar,
             text="Show fingers",
             variable=self.show_fingers,
             command=self.draw,
-        ).grid(row=1, column=4, columnspan=2, sticky="w", pady=(7, 0))
+        ).grid(row=1, column=6, columnspan=2, sticky="w", pady=(7, 0))
         ttk.Checkbutton(toolbar, text="Follow", variable=self.follow).grid(
-            row=1, column=6, columnspan=2, sticky="w", pady=(7, 0)
+            row=1, column=8, sticky="w", pady=(7, 0)
         )
         ttk.Button(toolbar, text="Save Project", command=self.save_project_file).grid(
-            row=1, column=8, sticky="e", padx=(10, 4), pady=(7, 0)
+            row=4, column=9, sticky="e", padx=(10, 4), pady=(7, 0)
         )
         ttk.Button(toolbar, text="Load Project", command=self.load_project_file).grid(
-            row=1, column=9, columnspan=2, sticky="e", pady=(7, 0)
+            row=4, column=10, sticky="e", pady=(7, 0)
         )
 
         ttk.Button(toolbar, text="Set A", command=self.set_loop_start).grid(
@@ -313,6 +329,7 @@ class PianoTrainerApp(tk.Tk):
         boolean_controls = (
             (self.follow, "follow"),
             (self.send_to_piano, "send_to_piano"),
+            (self.play_on_computer, "play_on_computer"),
             (self.practice_mode, "practice_mode"),
             (self.show_fingers, "show_fingers"),
         )
@@ -403,7 +420,9 @@ class PianoTrainerApp(tk.Tk):
             return
         if self.send_to_piano.get() and not self._ensure_output_port():
             self.send_to_piano.set(False)
-        if self.send_to_piano.get() and self.output_port is not None:
+        if self.play_on_computer.get() and not self._ensure_computer_synth():
+            self.play_on_computer.set(False)
+        if self.send_to_piano.get() or self.play_on_computer.get():
             self._reset_output_playback(self.paused_at)
 
     def stop_playback(self, send_off: bool = False) -> None:
@@ -535,6 +554,24 @@ class PianoTrainerApp(tk.Tk):
             return False
         return True
 
+    def _computer_output_changed(self) -> None:
+        if not self.play_on_computer.get() and self.computer_synth is not None:
+            self.computer_synth.reset(self._playback_channels())
+            self.computer_synth.close()
+            self.computer_synth = None
+
+    def _ensure_computer_synth(self) -> bool:
+        if self.computer_synth is None:
+            self.computer_synth = FluidSynthOutput()
+        try:
+            self.computer_synth.start()
+        except ComputerSynthError as exc:
+            self.computer_synth.close()
+            self.computer_synth = None
+            messagebox.showwarning("Computer playback unavailable", str(exc))
+            return False
+        return True
+
     def _update_position_display(self, force: bool = False) -> None:
         monotonic_now = time.monotonic()
         if not force and monotonic_now - self.last_position_update_time < self.position_update_interval:
@@ -610,39 +647,48 @@ class PianoTrainerApp(tk.Tk):
         self.loop_text.set(f"Loop: A {self.loop_start:.2f}s - B {self.loop_end:.2f}s ({state})")
 
     def _send_due_events(self, now: float) -> None:
-        if not self.send_to_piano.get() or self.output_port is None or self.song is None:
+        if self.song is None:
+            return
+        if not self.send_to_piano.get() and not self.play_on_computer.get():
             return
         events = self.song.playback_events
         while self.playback_event_index < len(events) and events[self.playback_event_index].time <= now:
             event = events[self.playback_event_index]
             self.playback_event_index += 1
             if event.kind == "control_change":
-                self.output_port.send(
-                    mido.Message(
-                        "control_change",
-                        control=event.control,
-                        value=event.value,
-                        channel=event.channel,
-                    )
+                self._send_playback_message(
+                    mido.Message("control_change", control=event.control, value=event.value, channel=event.channel)
                 )
                 continue
 
             key = (event.channel, event.note)
             if event.kind == "note_on":
                 if key in self.active_output_notes:
-                    self.output_port.send(
+                    self._send_playback_message(
                         mido.Message("note_off", note=event.note, velocity=0, channel=event.channel)
                     )
                 velocity = shape_velocity(event.velocity, self.dynamics.get())
-                self.output_port.send(
+                self._send_playback_message(
                     mido.Message("note_on", note=event.note, velocity=velocity, channel=event.channel)
                 )
                 self.active_output_notes[key] = event.note_id
             elif self.active_output_notes.get(key) == event.note_id:
-                self.output_port.send(
+                self._send_playback_message(
                     mido.Message("note_off", note=event.note, velocity=0, channel=event.channel)
                 )
                 self.active_output_notes.pop(key, None)
+
+    def _send_playback_message(self, message: mido.Message) -> None:
+        if self.send_to_piano.get() and self.output_port is not None:
+            self.output_port.send(message)
+        if self.play_on_computer.get() and self.computer_synth is not None:
+            try:
+                self.computer_synth.send(message)
+            except ComputerSynthError as exc:
+                self.play_on_computer.set(False)
+                self.computer_synth.close()
+                self.computer_synth = None
+                messagebox.showwarning("Computer playback stopped", str(exc))
 
     def _reset_output_playback(self, position: float) -> None:
         self.active_output_notes.clear()
@@ -749,17 +795,22 @@ class PianoTrainerApp(tk.Tk):
         self.status.configure(text=text)
 
     def _all_notes_off(self) -> None:
+        channels = self._playback_channels()
+        for channel, note in list(self.active_output_notes):
+            self._send_playback_message(mido.Message("note_off", note=note, velocity=0, channel=channel))
         if self.output_port is not None:
-            for channel, note in list(self.active_output_notes):
-                self.output_port.send(mido.Message("note_off", note=note, velocity=0, channel=channel))
-            channels = {event.channel for event in self.song.playback_events} if self.song else {0}
             for channel in channels:
                 for control in (64, 66, 67):
                     self.output_port.send(
                         mido.Message("control_change", control=control, value=0, channel=channel)
                     )
                 self.output_port.send(mido.Message("control_change", control=123, value=0, channel=channel))
+        if self.computer_synth is not None:
+            self.computer_synth.reset(channels)
         self.active_output_notes.clear()
+
+    def _playback_channels(self) -> Set[int]:
+        return {event.channel for event in self.song.playback_events} if self.song else {0}
 
     def draw(self) -> None:
         self.last_render_time = time.monotonic()
@@ -966,6 +1017,7 @@ class PianoTrainerApp(tk.Tk):
             "piano_volume": self.piano_volume.get(),
             "follow": self.follow.get(),
             "send_to_piano": self.send_to_piano.get(),
+            "play_on_computer": self.play_on_computer.get(),
             "practice_mode": self.practice_mode.get(),
             "show_fingers": self.show_fingers.get(),
             "loop_start": self.loop_start,
@@ -995,6 +1047,8 @@ class PianoTrainerApp(tk.Tk):
         self._all_notes_off()
         if self.output_port is not None:
             self.output_port.close()
+        if self.computer_synth is not None:
+            self.computer_synth.close()
         if self.input_port is not None:
             self.input_port.close()
         super().destroy()
@@ -1004,9 +1058,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Show how to play MIDI/audio songs on a Roland FP-10 style keyboard.")
     parser.add_argument("song", nargs="?", help="MIDI file, or audio file when an external converter is configured")
     parser.add_argument("--send-to-piano", action="store_true", help="play MIDI notes through the first Roland output port")
+    parser.add_argument("--play-on-computer", action="store_true", help="play MIDI through FluidSynth and computer audio")
     args = parser.parse_args(argv)
 
-    app = PianoTrainerApp(initial_song=args.song, send_to_piano=args.send_to_piano)
+    app = PianoTrainerApp(
+        initial_song=args.song,
+        send_to_piano=args.send_to_piano,
+        play_on_computer=args.play_on_computer,
+    )
     app.mainloop()
     return 0
 
