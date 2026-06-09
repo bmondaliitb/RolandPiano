@@ -91,6 +91,22 @@ def note_name(note: int) -> str:
     return f"{names[note % 12]}{octave}"
 
 
+def staff_note_position(note: int, clef: str) -> Tuple[int, bool]:
+    pitch_class = note % 12
+    octave = note // 12 - 1
+    letter_by_pitch_class = (0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6)
+    accidental = pitch_class in {1, 3, 6, 8, 10}
+    diatonic_index = octave * 7 + letter_by_pitch_class[pitch_class]
+
+    if clef == "treble":
+        bottom_line = 4 * 7 + 2  # E4
+    elif clef == "bass":
+        bottom_line = 2 * 7 + 4  # G2
+    else:
+        raise ValueError(f"Unknown clef: {clef}")
+    return diatonic_index - bottom_line, accidental
+
+
 def is_black_key(note: int) -> bool:
     return note % 12 in {1, 3, 6, 8, 10}
 

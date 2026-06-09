@@ -29,6 +29,7 @@ from .song_trainer import (
     open_output_port,
     practice_step_matches,
     shape_velocity,
+    staff_note_position,
     suggest_fingering,
 )
 
@@ -78,6 +79,8 @@ class PianoTrainerApp(tk.Tk):
         )
         self.practice_mode = tk.BooleanVar(value=self._saved_bool("practice_mode", False))
         self.show_fingers = tk.BooleanVar(value=self._saved_bool("show_fingers", False))
+        saved_view = self.saved_state.get("view_mode", "roll")
+        self.view_mode = tk.StringVar(value=saved_view if saved_view in {"roll", "sheet"} else "roll")
         self.loop_enabled = tk.BooleanVar(value=False)
         self.loop_start = 0.0
         self.loop_end: Optional[float] = None
@@ -168,6 +171,21 @@ class PianoTrainerApp(tk.Tk):
         ).grid(row=0, column=7, padx=(0, 6))
         self.dynamics_label = ttk.Label(toolbar, text="85%")
         self.dynamics_label.grid(row=0, column=8, sticky="e")
+        ttk.Label(toolbar, text="View").grid(row=0, column=9, padx=(12, 4))
+        ttk.Radiobutton(
+            toolbar,
+            text="Roll",
+            variable=self.view_mode,
+            value="roll",
+            command=self._view_mode_changed,
+        ).grid(row=0, column=10, sticky="w")
+        ttk.Radiobutton(
+            toolbar,
+            text="Sheet",
+            variable=self.view_mode,
+            value="sheet",
+            command=self._view_mode_changed,
+        ).grid(row=0, column=11, sticky="w")
 
         ttk.Checkbutton(toolbar, text="Send to Roland", variable=self.send_to_piano).grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(7, 0)
@@ -246,7 +264,8 @@ class PianoTrainerApp(tk.Tk):
         self.status = ttk.Label(toolbar, text="Open a MIDI file to begin.")
         self.status.grid(row=4, column=0, columnspan=9, sticky="ew", pady=(7, 0))
 
-        self.roll = tk.Canvas(self, background="#15171a", highlightthickness=0)
+        canvas_background = "#faf9f5" if self.view_mode.get() == "sheet" else "#15171a"
+        self.roll = tk.Canvas(self, background=canvas_background, highlightthickness=0)
         self.roll.grid(row=1, column=0, sticky="nsew")
         self.keyboard = tk.Canvas(self, height=150, background="#2b2f35", highlightthickness=0)
         self.keyboard.grid(row=2, column=0, sticky="ew")
@@ -337,6 +356,13 @@ class PianoTrainerApp(tk.Tk):
             value = state.get(key)
             if isinstance(value, bool):
                 variable.set(value)
+        view_mode = state.get("view_mode")
+        if view_mode in {"roll", "sheet"}:
+            self.view_mode.set(view_mode)
+
+    def _view_mode_changed(self) -> None:
+        self.roll.configure(background="#faf9f5" if self.view_mode.get() == "sheet" else "#15171a")
+        self.draw()
 
     def load_file(self, path: Path) -> None:
         self.stop_playback(send_off=True)
@@ -816,7 +842,7 @@ class PianoTrainerApp(tk.Tk):
         self.last_render_time = time.monotonic()
         self.roll.delete("all")
         self.keyboard.delete("all")
-        self._draw_roll()
+        self._draw_main_view()
         self._draw_keyboard()
         self.keyboard_signature = self._current_keyboard_signature()
 
@@ -827,7 +853,7 @@ class PianoTrainerApp(tk.Tk):
         self.last_render_time = monotonic_now
 
         self.roll.delete("all")
-        self._draw_roll()
+        self._draw_main_view()
 
         signature = self._current_keyboard_signature(now)
         if signature != self.keyboard_signature:
@@ -850,6 +876,14 @@ class PianoTrainerApp(tk.Tk):
             finger_labels,
             self.practice_mode.get(),
         )
+
+    def _draw_main_view(self) -> None:
+        if self.view_mode.get() == "sheet":
+            self.roll.configure(background="#faf9f5")
+            self._draw_sheet_music()
+        else:
+            self.roll.configure(background="#15171a")
+            self._draw_roll()
 
     def _draw_roll(self) -> None:
         width = max(self.roll.winfo_width(), 1)
@@ -915,6 +949,195 @@ class PianoTrainerApp(tk.Tk):
             return
         self.roll.create_line(0, y, width, y, fill=color, width=2, dash=(6, 4))
         self.roll.create_text(8, y - 4, text=label, fill=color, anchor="sw", font=("TkDefaultFont", 10, "bold"))
+
+    def _draw_sheet_music(self) -> None:
+        width = max(self.roll.winfo_width(), 1)
+        height = max(self.roll.winfo_height(), 1)
+        ink = "#24272c"
+        muted = "#777b82"
+        staff_left = 72
+        staff_right = width - 24
+        line_spacing = max(10, min(16, height // 34))
+        treble_top = max(52, int(height * 0.20))
+        bass_top = min(height - line_spacing * 5 - 42, int(height * 0.58))
+
+        for top, label in ((treble_top, "TREBLE"), (bass_top, "BASS")):
+            for line in range(5):
+                y = top + line * line_spacing
+                self.roll.create_line(staff_left, y, staff_right, y, fill=ink, width=1)
+            self.roll.create_text(
+                staff_left - 10,
+                top + line_spacing * 2,
+                text=label,
+                fill=muted,
+                anchor="e",
+                font=("TkDefaultFont", 9, "bold"),
+            )
+        self.roll.create_line(
+            staff_left,
+            treble_top,
+            staff_left,
+            bass_top + line_spacing * 4,
+            fill=ink,
+            width=2,
+        )
+
+        if self.song is None:
+            self.roll.create_text(
+                width / 2,
+                height / 2,
+                text="Open a song to begin",
+                fill=ink,
+                font=("TkDefaultFont", 22),
+            )
+            return
+
+        now = self.current_time()
+        past_seconds = 1.5
+        future_seconds = 5.0
+        usable_width = max(1, staff_right - staff_left)
+        play_x = staff_left + usable_width * past_seconds / (past_seconds + future_seconds)
+        pixels_per_second = usable_width / (past_seconds + future_seconds)
+        self.roll.create_line(
+            play_x,
+            treble_top - 28,
+            play_x,
+            bass_top + line_spacing * 4 + 28,
+            fill="#d39b22",
+            width=2,
+        )
+
+        visible_notes = self._notes_in_window(now - past_seconds, now + future_seconds)
+        target_step = self._current_practice_step() if self.practice_waiting else None
+        target_notes = set(target_step.notes) if target_step else set()
+
+        for note in visible_notes:
+            x = play_x + (note.start - now) * pixels_per_second
+            clef = "treble" if note.note >= 60 else "bass"
+            top = treble_top if clef == "treble" else bass_top
+            step, accidental = staff_note_position(note.note, clef)
+            bottom_line_y = top + line_spacing * 4
+            y = bottom_line_y - step * (line_spacing / 2)
+
+            is_active = note.start <= now <= note.end
+            is_target = (
+                target_step is not None
+                and note.note in target_notes
+                and abs(note.start - target_step.start) <= 0.04
+            )
+            if is_target and note.note in self.pressed_notes:
+                color = "#278a52"
+            elif is_target:
+                color = "#2374c6"
+            elif is_active:
+                color = "#d39b22"
+            else:
+                color = ink
+
+            self._draw_ledger_lines(x, y, step, bottom_line_y, line_spacing, color)
+            if accidental:
+                self.roll.create_text(
+                    x - 11,
+                    y,
+                    text="#",
+                    fill=color,
+                    anchor="e",
+                    font=("TkDefaultFont", 10, "bold"),
+                )
+
+            note_width = max(8, line_spacing * 0.9)
+            note_height = max(6, line_spacing * 0.62)
+            fill = color if note.duration < 0.8 else "#faf9f5"
+            self.roll.create_oval(
+                x - note_width / 2,
+                y - note_height / 2,
+                x + note_width / 2,
+                y + note_height / 2,
+                fill=fill,
+                outline=color,
+                width=2,
+            )
+            stem_up = step < 4
+            stem_x = x + note_width / 2 if stem_up else x - note_width / 2
+            stem_end = y - line_spacing * 2.8 if stem_up else y + line_spacing * 2.8
+            self.roll.create_line(stem_x, y, stem_x, stem_end, fill=color, width=2)
+
+        self._draw_sheet_loop_marker(
+            self.loop_start,
+            "A",
+            "#278a52",
+            now,
+            play_x,
+            pixels_per_second,
+            treble_top,
+            bass_top + line_spacing * 4,
+        )
+        if self.loop_end is not None:
+            self._draw_sheet_loop_marker(
+                self.loop_end,
+                "B",
+                "#c74747",
+                now,
+                play_x,
+                pixels_per_second,
+                treble_top,
+                bass_top + line_spacing * 4,
+            )
+
+        if target_step is not None:
+            self.roll.create_text(
+                width / 2,
+                18,
+                text=f"PLAY  {self._step_text(target_step)}",
+                fill="#2374c6",
+                anchor="n",
+                font=("TkDefaultFont", 16, "bold"),
+            )
+        self.roll.create_text(
+            width - 14,
+            16,
+            text=f"{now:.1f} / {self.song.duration:.1f}s",
+            fill=muted,
+            anchor="ne",
+        )
+
+    def _draw_ledger_lines(
+        self,
+        x: float,
+        y: float,
+        step: int,
+        bottom_line_y: float,
+        line_spacing: int,
+        color: str,
+    ) -> None:
+        ledger_width = line_spacing * 1.35
+        if step <= -2:
+            for ledger_step in range(-2, step - 1, -2):
+                ledger_y = bottom_line_y - ledger_step * (line_spacing / 2)
+                self.roll.create_line(x - ledger_width, ledger_y, x + ledger_width, ledger_y, fill=color)
+        elif step >= 10:
+            for ledger_step in range(10, step + 1, 2):
+                ledger_y = bottom_line_y - ledger_step * (line_spacing / 2)
+                self.roll.create_line(x - ledger_width, ledger_y, x + ledger_width, ledger_y, fill=color)
+
+    def _draw_sheet_loop_marker(
+        self,
+        position: float,
+        label: str,
+        color: str,
+        now: float,
+        play_x: float,
+        pixels_per_second: float,
+        top: float,
+        bottom: float,
+    ) -> None:
+        if self.loop_end is None:
+            return
+        x = play_x + (position - now) * pixels_per_second
+        if not 0 <= x <= self.roll.winfo_width():
+            return
+        self.roll.create_line(x, top - 12, x, bottom + 12, fill=color, width=2, dash=(5, 4))
+        self.roll.create_text(x + 4, top - 14, text=label, fill=color, anchor="sw", font=("TkDefaultFont", 10, "bold"))
 
     def _draw_keyboard(self, now: Optional[float] = None) -> None:
         width = max(self.keyboard.winfo_width(), 1)
@@ -1020,6 +1243,7 @@ class PianoTrainerApp(tk.Tk):
             "play_on_computer": self.play_on_computer.get(),
             "practice_mode": self.practice_mode.get(),
             "show_fingers": self.show_fingers.get(),
+            "view_mode": self.view_mode.get(),
             "loop_start": self.loop_start,
             "loop_end": self.loop_end,
             "loop_enabled": self.loop_enabled.get(),

@@ -14,6 +14,7 @@ from src.roland_piano.song_trainer import (
     note_name,
     practice_step_matches,
     shape_velocity,
+    staff_note_position,
     suggest_fingering,
 )
 
@@ -133,6 +134,15 @@ class TestSongTrainer(unittest.TestCase):
         self.assertEqual(message.type, "sysex")
         self.assertEqual(tuple(message.data[7:11]), tuple(RolandAddressMap.masterVolume.address))
         self.assertEqual(message.data[11], 42)
+
+    def test_staff_note_positions(self):
+        self.assertEqual(staff_note_position(64, "treble"), (0, False))  # E4 bottom line
+        self.assertEqual(staff_note_position(67, "treble"), (2, False))  # G4 second line
+        self.assertEqual(staff_note_position(43, "bass"), (0, False))  # G2 bottom line
+        self.assertEqual(staff_note_position(61, "treble"), (-2, True))  # C#4 ledger line
+
+        with self.assertRaises(ValueError):
+            staff_note_position(60, "alto")
 
 
 if __name__ == "__main__":

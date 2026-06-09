@@ -62,6 +62,8 @@ To practice in wait mode:
 
 Correct pressed keys turn green. Extra incorrect keys turn red. For chords, all chord notes must be held together before the song advances.
 
+Use the `Roll` and `Sheet` view controls to switch between falling notes and a moving grand staff. The sheet view shows treble and bass staves, accidentals, ledger lines, and highlights sounding notes or the current wait-mode target.
+
 Enable `Show fingers` to display suggested finger labels on target keys and in the practice prompt. `L` and `R` mean left and right hand; fingers are numbered `1` for the thumb through `5` for the little finger. These suggestions are generated from note position and common chord shapes because ordinary MIDI files do not contain authoritative fingering.
 
 To repeat a short section, use the `Position` slider to move the playhead to the beginning and press `Set A`, then move it to the end and press `Set B`. Setting B enables `Loop` automatically. The section repeats in normal playback and in `Wait for keys` mode. Use `Clear` to remove the loop.
