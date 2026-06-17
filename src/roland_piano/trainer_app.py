@@ -28,6 +28,7 @@ from .song_trainer import (
     open_input_port,
     open_output_port,
     practice_step_matches,
+    practice_step_for_hand,
     shape_velocity,
     staff_note_position,
     suggest_fingering,
@@ -37,6 +38,7 @@ from .song_trainer import (
 LOW_NOTE = 21
 HIGH_NOTE = 108
 WHITE_KEY_PATTERN = {0, 2, 4, 5, 7, 9, 11}
+PRACTICE_EARLY_PRESS_GRACE = 1.5
 
 
 class PianoTrainerApp(tk.Tk):
@@ -79,6 +81,8 @@ class PianoTrainerApp(tk.Tk):
         )
         self.practice_mode = tk.BooleanVar(value=self._saved_bool("practice_mode", False))
         self.show_fingers = tk.BooleanVar(value=self._saved_bool("show_fingers", False))
+        saved_hand = self.saved_state.get("practice_hand", "both")
+        self.practice_hand = tk.StringVar(value=saved_hand if saved_hand in {"both", "left", "right"} else "both")
         saved_view = self.saved_state.get("view_mode", "roll")
         self.view_mode = tk.StringVar(value=saved_view if saved_view in {"roll", "sheet"} else "roll")
         self.loop_enabled = tk.BooleanVar(value=False)
@@ -95,6 +99,7 @@ class PianoTrainerApp(tk.Tk):
         self.active_output_notes: Dict[Tuple[int, int], int] = {}
         self.playback_event_index = 0
         self.pressed_notes: Set[int] = set()
+        self.recent_practice_presses: Dict[int, float] = {}
         self.practice_steps: Tuple[PracticeStep, ...] = tuple()
         self.practice_step_starts: Tuple[float, ...] = tuple()
         self.practice_index = 0
@@ -211,6 +216,28 @@ class PianoTrainerApp(tk.Tk):
         ttk.Checkbutton(toolbar, text="Follow", variable=self.follow).grid(
             row=1, column=8, sticky="w", pady=(7, 0)
         )
+        ttk.Label(toolbar, text="Practice").grid(row=1, column=9, sticky="e", padx=(10, 4), pady=(7, 0))
+        ttk.Radiobutton(
+            toolbar,
+            text="Both",
+            variable=self.practice_hand,
+            value="both",
+            command=self._practice_hand_changed,
+        ).grid(row=1, column=10, sticky="w", pady=(7, 0))
+        ttk.Radiobutton(
+            toolbar,
+            text="Left",
+            variable=self.practice_hand,
+            value="left",
+            command=self._practice_hand_changed,
+        ).grid(row=1, column=11, sticky="w", pady=(7, 0))
+        ttk.Radiobutton(
+            toolbar,
+            text="Right",
+            variable=self.practice_hand,
+            value="right",
+            command=self._practice_hand_changed,
+        ).grid(row=1, column=12, sticky="w", pady=(7, 0))
         ttk.Button(toolbar, text="Save Project", command=self.save_project_file).grid(
             row=4, column=9, sticky="e", padx=(10, 4), pady=(7, 0)
         )
@@ -359,6 +386,9 @@ class PianoTrainerApp(tk.Tk):
         view_mode = state.get("view_mode")
         if view_mode in {"roll", "sheet"}:
             self.view_mode.set(view_mode)
+        practice_hand = state.get("practice_hand")
+        if practice_hand in {"both", "left", "right"}:
+            self.practice_hand.set(practice_hand)
 
     def _view_mode_changed(self) -> None:
         self.roll.configure(background="#faf9f5" if self.view_mode.get() == "sheet" else "#15171a")
@@ -389,6 +419,7 @@ class PianoTrainerApp(tk.Tk):
         self.practice_index = 0
         self.practice_waiting = False
         self.pressed_notes.clear()
+        self.recent_practice_presses.clear()
         self.paused_at = 0.0
         self._reset_output_playback(0.0)
         self.clear_loop()
@@ -443,6 +474,7 @@ class PianoTrainerApp(tk.Tk):
         self.play_button.configure(text="Pause")
         self._update_status()
         if self.practice_mode.get():
+            self.recent_practice_presses.clear()
             return
         if self.send_to_piano.get() and not self._ensure_output_port():
             self.send_to_piano.set(False)
@@ -465,6 +497,7 @@ class PianoTrainerApp(tk.Tk):
         self.paused_at = 0.0
         self._reset_output_playback(0.0)
         self.pressed_notes.clear()
+        self.recent_practice_presses.clear()
         self.practice_index = 0
         self.practice_waiting = False
         self._update_status()
@@ -488,6 +521,7 @@ class PianoTrainerApp(tk.Tk):
         self._reset_output_playback(self.paused_at)
         self._set_practice_index_for_time(self.paused_at)
         self.practice_waiting = False
+        self.recent_practice_presses.clear()
         if self.playing:
             self.started_at = time.monotonic() - (self.paused_at / self.tempo.get())
         self._update_position_display(force=True)
@@ -726,6 +760,16 @@ class PianoTrainerApp(tk.Tk):
         self.practice_index = 0
         self.practice_waiting = False
         self.pressed_notes.clear()
+        self.recent_practice_presses.clear()
+        self._update_status()
+        self.draw()
+
+    def _practice_hand_changed(self) -> None:
+        if self.song is not None:
+            self.stop_playback(send_off=True)
+            self.practice_waiting = False
+            self._set_practice_index_for_time(self.paused_at)
+            self.recent_practice_presses.clear()
         self._update_status()
         self.draw()
 
@@ -754,6 +798,7 @@ class PianoTrainerApp(tk.Tk):
                 break
             if message.type == "note_on" and message.velocity > 0:
                 self.pressed_notes.add(message.note)
+                self.recent_practice_presses[message.note] = time.monotonic()
                 changed = True
                 self._try_complete_practice_step()
             elif message.type == "note_off" or (message.type == "note_on" and message.velocity == 0):
@@ -764,23 +809,33 @@ class PianoTrainerApp(tk.Tk):
             self.draw()
 
     def _update_practice_wait(self, now: float) -> float:
-        if self.practice_index >= len(self.practice_steps):
-            return now
-        step = self.practice_steps[self.practice_index]
-        if now >= step.start:
-            self.paused_at = step.start
-            self.practice_waiting = True
-            self._update_status()
-            return step.start
+        while self.practice_index < len(self.practice_steps):
+            step = self.practice_steps[self.practice_index]
+            target = self._practice_target_step(step)
+            if target is None and now >= step.start:
+                self.practice_index += 1
+                continue
+            if target is not None and now >= target.start:
+                self.paused_at = target.start
+                self.practice_waiting = True
+                self._update_status()
+                self._try_complete_practice_step()
+                return target.start
+            break
         return now
 
     def _try_complete_practice_step(self) -> None:
         if not self.playing or not self.practice_mode.get() or not self.practice_waiting:
             return
         step = self._current_practice_step()
-        if step is None or not practice_step_matches(step, self.pressed_notes):
+        match_notes = self._practice_match_notes()
+        if step is None or not practice_step_matches(step, match_notes, self.practice_hand.get()):
             return
 
+        target = self._practice_target_step(step)
+        if target is not None:
+            for note in target.notes:
+                self.recent_practice_presses.pop(note, None)
         self.practice_index += 1
         self.practice_waiting = False
         if self.practice_index >= len(self.practice_steps):
@@ -799,6 +854,33 @@ class PianoTrainerApp(tk.Tk):
             return self.practice_steps[self.practice_index]
         return None
 
+    def _current_practice_target_step(self) -> Optional[PracticeStep]:
+        step = self._current_practice_step()
+        if step is None:
+            return None
+        return self._practice_target_step(step)
+
+    def _next_practice_target_step(self) -> Optional[PracticeStep]:
+        for step in self.practice_steps[self.practice_index :]:
+            target = self._practice_target_step(step)
+            if target is not None:
+                return target
+        return None
+
+    def _practice_target_step(self, step: PracticeStep) -> Optional[PracticeStep]:
+        return practice_step_for_hand(step, self.practice_hand.get())
+
+    def _practice_match_notes(self) -> Set[int]:
+        now = time.monotonic()
+        expired = [
+            note
+            for note, pressed_at in self.recent_practice_presses.items()
+            if now - pressed_at > PRACTICE_EARLY_PRESS_GRACE
+        ]
+        for note in expired:
+            self.recent_practice_presses.pop(note, None)
+        return set(self.pressed_notes) | set(self.recent_practice_presses)
+
     def _set_practice_index_for_time(self, position: float) -> None:
         self.practice_index = bisect_left(self.practice_step_starts, position)
 
@@ -807,13 +889,14 @@ class PianoTrainerApp(tk.Tk):
             self.status.configure(text="Open a MIDI file to begin.")
             return
         if self.practice_mode.get():
-            step = self._current_practice_step()
+            step = self._current_practice_target_step() if self.practice_waiting else self._next_practice_target_step()
+            hand_label = self._practice_hand_label()
             if step is None:
                 text = f"{self.song.path.name}: practice complete"
             elif self.practice_waiting:
-                text = f"Play: {self._step_text(step)}"
+                text = f"Play {hand_label}: {self._step_text(step)}"
             else:
-                text = f"{self.song.path.name}: next {self._step_text(step)}"
+                text = f"{self.song.path.name}: next {hand_label} {self._step_text(step)}"
         else:
             text = f"{self.song.path.name}: {len(self.song.notes)} notes, {self.song.duration:.1f}s"
         if self._loop_is_active():
@@ -865,8 +948,9 @@ class PianoTrainerApp(tk.Tk):
         if now is None:
             now = self.current_time()
         step = self._current_practice_step()
-        expected = tuple(step.notes) if self.practice_waiting and step else tuple()
-        finger_labels = tuple(sorted(self._finger_labels(step).items()))
+        target = self._current_practice_target_step()
+        expected = tuple(target.notes) if self.practice_waiting and target else tuple()
+        finger_labels = tuple(sorted(self._finger_labels(step, set(expected) if expected else None).items()))
         return (
             self.keyboard.winfo_width(),
             self.keyboard.winfo_height(),
@@ -875,6 +959,7 @@ class PianoTrainerApp(tk.Tk):
             expected,
             finger_labels,
             self.practice_mode.get(),
+            self.practice_hand.get(),
         )
 
     def _draw_main_view(self) -> None:
@@ -916,7 +1001,7 @@ class PianoTrainerApp(tk.Tk):
 
         next_index = bisect_left(self.note_starts, now)
         next_notes = self.song.notes[next_index : next_index + 8]
-        step = self._current_practice_step() if self.practice_mode.get() else None
+        step = self._current_practice_target_step() if self.practice_mode.get() else None
         if self.practice_waiting and step is not None:
             text = self._step_text(step)
             self.roll.create_text(
@@ -1008,7 +1093,7 @@ class PianoTrainerApp(tk.Tk):
         )
 
         visible_notes = self._notes_in_window(now - past_seconds, now + future_seconds)
-        target_step = self._current_practice_step() if self.practice_waiting else None
+        target_step = self._current_practice_target_step() if self.practice_waiting else None
         target_notes = set(target_step.notes) if target_step else set()
 
         for note in visible_notes:
@@ -1144,8 +1229,9 @@ class PianoTrainerApp(tk.Tk):
         height = max(self.keyboard.winfo_height(), 1)
         active = self._active_notes_at(self.current_time() if now is None else now)
         step = self._current_practice_step()
-        expected = set(step.notes) if self.practice_waiting and step else set()
-        finger_labels = self._finger_labels(step)
+        target = self._current_practice_target_step()
+        expected = set(target.notes) if self.practice_waiting and target else set()
+        finger_labels = self._finger_labels(step, expected if expected else None)
         white_notes = [note for note in range(LOW_NOTE, HIGH_NOTE + 1) if note % 12 in WHITE_KEY_PATTERN]
         white_width = width / len(white_notes)
         white_positions: Dict[int, Tuple[float, float]] = {}
@@ -1191,23 +1277,24 @@ class PianoTrainerApp(tk.Tk):
             )
 
     def _step_text(self, step: PracticeStep) -> str:
-        labels = self._finger_labels(step)
+        labels = self._finger_labels(self._current_practice_step() or step, set(step.notes))
         return " + ".join(
             f"{note_name(note)} ({labels[note]})" if note in labels else note_name(note)
             for note in step.notes
         )
 
-    def _finger_labels(self, step: Optional[PracticeStep]) -> Dict[int, str]:
+    def _finger_labels(self, step: Optional[PracticeStep], notes: Optional[Set[int]] = None) -> Dict[int, str]:
         if not self.practice_mode.get() or not self.show_fingers.get() or step is None:
             return {}
         return {
             suggestion.note: suggestion.label
             for suggestion in suggest_fingering(step)
+            if notes is None or suggestion.note in notes
         }
 
     def _key_fill(self, note: int, active: Set[int], expected: Set[int], black: bool) -> str:
         if self.practice_mode.get():
-            if note in self.pressed_notes and note not in expected:
+            if note in self.pressed_notes and note not in expected and self._practice_note_is_relevant(note, expected):
                 return "#d64545"
             if note in self.pressed_notes and note in expected:
                 return "#27ae60"
@@ -1216,6 +1303,21 @@ class PianoTrainerApp(tk.Tk):
         if note in active:
             return "#f2c14e"
         return "#15171a" if black else "#f7f7f3"
+
+    def _practice_hand_label(self) -> str:
+        return {
+            "both": "both hands",
+            "left": "left hand",
+            "right": "right hand",
+        }.get(self.practice_hand.get(), "both hands")
+
+    def _practice_note_is_relevant(self, note: int, expected: Set[int]) -> bool:
+        hand = self.practice_hand.get()
+        if hand == "left":
+            return note < 60 or note in expected
+        if hand == "right":
+            return note >= 60 or note in expected
+        return True
 
     def _active_notes(self) -> Set[int]:
         return self._active_notes_at(self.current_time())
@@ -1242,6 +1344,7 @@ class PianoTrainerApp(tk.Tk):
             "send_to_piano": self.send_to_piano.get(),
             "play_on_computer": self.play_on_computer.get(),
             "practice_mode": self.practice_mode.get(),
+            "practice_hand": self.practice_hand.get(),
             "show_fingers": self.show_fingers.get(),
             "view_mode": self.view_mode.get(),
             "loop_start": self.loop_start,

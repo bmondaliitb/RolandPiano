@@ -195,8 +195,34 @@ def build_practice_steps(song: Song, chord_tolerance: float = 0.04) -> Tuple[Pra
     return tuple(steps)
 
 
-def practice_step_matches(step: PracticeStep, pressed_notes: Set[int]) -> bool:
-    return pressed_notes == set(step.notes)
+def practice_step_for_hand(step: PracticeStep, hand: str) -> Optional[PracticeStep]:
+    if hand == "both":
+        return step
+    left_notes, right_notes = _split_hands(step.notes)
+    if hand == "left":
+        notes = left_notes
+    elif hand == "right":
+        notes = right_notes
+    else:
+        raise ValueError(f"Unknown practice hand: {hand}")
+    if not notes:
+        return None
+    return PracticeStep(start=step.start, notes=notes)
+
+
+def practice_step_matches(step: PracticeStep, pressed_notes: Set[int], hand: str = "both") -> bool:
+    target = practice_step_for_hand(step, hand)
+    if target is None:
+        return True
+    if hand == "both":
+        relevant_pressed = pressed_notes
+    elif hand == "left":
+        relevant_pressed = {note for note in pressed_notes if note < 60 or note in target.notes}
+    elif hand == "right":
+        relevant_pressed = {note for note in pressed_notes if note >= 60 or note in target.notes}
+    else:
+        raise ValueError(f"Unknown practice hand: {hand}")
+    return relevant_pressed == set(target.notes)
 
 
 def suggest_fingering(step: PracticeStep) -> Tuple[FingerSuggestion, ...]:

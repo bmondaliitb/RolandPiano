@@ -13,6 +13,7 @@ from src.roland_piano.song_trainer import (
     load_song,
     note_name,
     practice_step_matches,
+    practice_step_for_hand,
     shape_velocity,
     staff_note_position,
     suggest_fingering,
@@ -70,6 +71,24 @@ class TestSongTrainer(unittest.TestCase):
         self.assertFalse(practice_step_matches(step, {60, 64}))
         self.assertFalse(practice_step_matches(step, {60, 64, 67, 72}))
         self.assertTrue(practice_step_matches(step, {60, 64, 67}))
+
+    def test_practice_step_can_filter_to_left_or_right_hand(self):
+        step = PracticeStep(start=1.0, notes=(48, 52, 60, 64))
+
+        self.assertEqual(practice_step_for_hand(step, "left").notes, (48, 52))
+        self.assertEqual(practice_step_for_hand(step, "right").notes, (60, 64))
+        self.assertIsNone(practice_step_for_hand(PracticeStep(start=1.0, notes=(72,)), "left"))
+
+    def test_hand_practice_waits_only_for_selected_hand(self):
+        step = PracticeStep(start=1.0, notes=(48, 52, 60, 64))
+
+        self.assertTrue(practice_step_matches(step, {48, 52}, "left"))
+        self.assertTrue(practice_step_matches(step, {48, 52, 60}, "left"))
+        self.assertFalse(practice_step_matches(step, {48}, "left"))
+        self.assertFalse(practice_step_matches(step, {48, 52, 55}, "left"))
+        self.assertTrue(practice_step_matches(step, {60, 64}, "right"))
+        self.assertTrue(practice_step_matches(step, {48, 60, 64}, "right"))
+        self.assertFalse(practice_step_matches(step, {60}, "right"))
 
     def test_fingering_suggests_standard_triad_shapes(self):
         left = suggest_fingering(PracticeStep(start=0.0, notes=(48, 52, 55)))

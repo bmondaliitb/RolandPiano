@@ -57,10 +57,12 @@ To practice in wait mode:
 
 1. Connect the FP-10 to Fedora by USB and open a MIDI song.
 2. Enable `Wait for keys`.
-3. Press `Play`.
-4. Play the blue target key or chord. The song remains stopped until the physically held keys exactly match the target.
+3. Choose `Both`, `Left`, or `Right` in the `Practice` controls.
+4. Press `Play`.
+5. Play the blue target key or chord. The song remains stopped until the physically held keys exactly match the target.
 
 Correct pressed keys turn green. Extra incorrect keys turn red. For chords, all chord notes must be held together before the song advances.
+In `Left` or `Right` mode, the trainer only waits for notes assigned to that hand and skips notes that belong only to the other hand. Notes from the other hand do not block the selected-hand match.
 
 Use the `Roll` and `Sheet` view controls to switch between falling notes and a moving grand staff. The sheet view shows treble and bass staves, accidentals, ledger lines, and highlights sounding notes or the current wait-mode target.
 
